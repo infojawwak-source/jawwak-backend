@@ -27,7 +27,7 @@ const DUFFEL_API_VERSION = 'v2';
 // تكلفة تدبير العملة (تحويل جنيه لدولار للدفع) — تكلفة حقيقية عليك، مش ربح
 const CURRENCY_FEE_PERCENT = 5; // %
 // هامش ربحك، بيتحط فوق التكلفة الحقيقية (بعد تدبير العملة)
-const PROFIT_MARGIN_PERCENT = 8; // %
+const PROFIT_MARGIN_PERCENT = 6; // %
 
 function duffelHeaders() {
   return {
