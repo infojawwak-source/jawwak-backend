@@ -25,9 +25,9 @@ const DUFFEL_API_VERSION = 'v2';
 // إعدادات التسعير — غيّرهم من هنا لو حبيت تعدّل النسب لاحقاً
 // ══════════════════════════════════════════════
 // تكلفة تدبير العملة (تحويل جنيه لدولار للدفع) — تكلفة حقيقية عليك، مش ربح
-const CURRENCY_FEE_PERCENT = 5; // %
+const CURRENCY_FEE_PERCENT = 3; // %
 // هامش ربحك، بيتحط فوق التكلفة الحقيقية (بعد تدبير العملة)
-const PROFIT_MARGIN_PERCENT = 6; // %
+const PROFIT_MARGIN_PERCENT = 3; // %
 
 function duffelHeaders() {
   return {
