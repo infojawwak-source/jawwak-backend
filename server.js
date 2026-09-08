@@ -189,7 +189,7 @@ function extractRefundInfo(offer) {
 // تحويل رد Duffel المعقد لشكل بسيط يفهمه الموقع، مع تحويل السعر لجنيه مصري
 // ══════════════════════════════════════════════
 async function formatDuffelResults(offers) {
-  const sliced = offers.slice(0, 15);
+  const sliced = offers.slice(0, 30);
 
   const results = await Promise.all(sliced.map(async (offer) => {
     const firstSlice = offer.slices[0];
