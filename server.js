@@ -293,8 +293,7 @@ function extractRefundInfo(offer) {
 // ══════════════════════════════════════════════
 async function formatDuffelResults(offers) {
 
-  // بنحسب سعر كل العروض أولاً، وبعدها نرتبهم من الأرخص للأغلى
-  // ثم نعرض أرخص 30 رحلة فقط.
+  // بنحسب سعر كل العروض أولاً
   const results = await Promise.all(
     offers.map(async (offer) => {
 
@@ -481,13 +480,85 @@ async function formatDuffelResults(offers) {
     })
   );
 
-  // نشيل العروض اللي فشل حساب سعرها،
-  // نرتب الباقي من الأرخص للأغلى،
-  // ونعرض أرخص 30 رحلة فقط.
-  return results
+  // نشيل العروض اللي فشل حساب سعرها
+  // ونرتب كل الرحلات من الأرخص للأغلى أولاً
+  const sortedResults = results
     .filter(Boolean)
-    .sort((a, b) => a.price - b.price)
-    .slice(0, MAX_RESULTS);
+    .sort((a, b) => a.price - b.price);
+
+  // ══════════════════════════════════════════════
+  // التوزيع الذكي الديناميكي
+  //
+  // مفيش عدد ثابت للرحلات من أي شركة.
+  //
+  // السعر يفضل العامل الأساسي، لكن لما شركة تظهر
+  // بشكل متكرر جداً، ندي أفضلية بسيطة للرحلات من
+  // شركات أخرى طالما فرق السعر معقول.
+  //
+  // الهدف:
+  // أرخص الرحلات + تنوع طبيعي في شركات الطيران.
+  // ══════════════════════════════════════════════
+
+  const selectedResults = [];
+  const remainingResults = [...sortedResults];
+  const airlineCounts = new Map();
+
+  while (
+    selectedResults.length < MAX_RESULTS &&
+    remainingResults.length > 0
+  ) {
+
+    let bestIndex = 0;
+    let bestScore = Infinity;
+
+    for (let i = 0; i < remainingResults.length; i++) {
+      const flight = remainingResults[i];
+
+      const airlineKey =
+        flight.airlineCode ||
+        flight.airlineName ||
+        'unknown';
+
+      const airlineCount =
+        airlineCounts.get(airlineKey) || 0;
+
+      // كلما زاد ظهور نفس الشركة،
+      // تزيد عقوبة التكرار تدريجياً.
+      //
+      // العقوبة نسبتها من السعر، لذلك الرحلة الأرخص
+      // تظل لها أفضلية واضحة، ولا يتم استبعادها لمجرد التنوع.
+      const diversityPenalty =
+        airlineCount * 0.025;
+
+      const score =
+        flight.price * (1 + diversityPenalty);
+
+      if (score < bestScore) {
+        bestScore = score;
+        bestIndex = i;
+      }
+    }
+
+    const selectedFlight =
+      remainingResults.splice(bestIndex, 1)[0];
+
+    const airlineKey =
+      selectedFlight.airlineCode ||
+      selectedFlight.airlineName ||
+      'unknown';
+
+    airlineCounts.set(
+      airlineKey,
+      (airlineCounts.get(airlineKey) || 0) + 1
+    );
+
+    selectedResults.push(selectedFlight);
+  }
+
+  // نرتب النتائج النهائية من الأرخص للأغلى
+  // عشان العميل يفضل شايف السعر الأرخص في البداية.
+  return selectedResults
+    .sort((a, b) => a.price - b.price);
 }
 
 // ══════════════════════════════════════════════
