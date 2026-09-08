@@ -212,28 +212,47 @@ async function formatDuffelResults(offers) {
     const baggage = extractBaggageInfo(firstSegment);
     const refund = extractRefundInfo(offer);
 
+    // تحديد شركة الطيران من الـ segment نفسه
+    // بدل offer.owner، عشان تظهر شركة التشغيل الفعلية
+    // مثل flynas / flyadeal بدل شركة الـ owner مثل Hahn Air
+    const operatingCarrier = firstSegment.operating_carrier;
+    const marketingCarrier = firstSegment.marketing_carrier;
+    const displayCarrier = operatingCarrier || marketingCarrier;
+
     // لو فيه رحلة عودة (slice تاني)، نستخرج بياناتها بنفس الطريقة
     let returnLeg = null;
     if (offer.slices.length > 1) {
       const retSlice = offer.slices[1];
       const retFirstSeg = retSlice.segments[0];
       const retLastSeg = retSlice.segments[retSlice.segments.length - 1];
+
+      const returnCarrier =
+        retFirstSeg.operating_carrier || retFirstSeg.marketing_carrier;
+
       returnLeg = {
         from: retFirstSeg.origin?.iata_code,
         to: retLastSeg.destination?.iata_code,
         depTime: (retFirstSeg.departing_at || '').slice(11, 16),
-        arrTime: (retLastSeg.arriving_at || '').slice(11, 16),
+        arrTime: (retFirstSeg.arriving_at || '').slice(11, 16),
         duration: (retSlice.duration || '').replace('PT', '').toLowerCase(),
         stops: retSlice.segments.length - 1,
-        flightNumber: (offer.owner?.iata_code || '') + (retFirstSeg.operating_carrier_flight_number || retFirstSeg.marketing_carrier_flight_number || ''),
+        flightNumber:
+          (returnCarrier?.iata_code || '') +
+          (retFirstSeg.operating_carrier_flight_number ||
+            retFirstSeg.marketing_carrier_flight_number ||
+            ''),
       };
     }
 
     return {
       id: offer.id,
-      airlineCode: offer.owner?.iata_code || '',
-      airlineName: offer.owner?.name || 'شركة طيران',
-      flightNumber: (offer.owner?.iata_code || '') + (firstSegment.operating_carrier_flight_number || firstSegment.marketing_carrier_flight_number || ''),
+      airlineCode: displayCarrier?.iata_code || '',
+      airlineName: displayCarrier?.name || 'شركة طيران',
+      flightNumber:
+        (displayCarrier?.iata_code || '') +
+        (firstSegment.operating_carrier_flight_number ||
+          firstSegment.marketing_carrier_flight_number ||
+          ''),
       from: firstSegment.origin?.iata_code,
       to: lastSegment.destination?.iata_code,
       depTime: (firstSegment.departing_at || '').slice(11, 16),
