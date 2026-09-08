@@ -30,7 +30,7 @@ const CURRENCY_FEE_PERCENT = 3; // %
 const PROFIT_MARGIN_PERCENT = 5; // %
 
 // عدد الرحلات المعروضة للعميل
-const MAX_RESULTS = 30;
+const MAX_RESULTS = 50;
 
 function duffelHeaders() {
   return {
