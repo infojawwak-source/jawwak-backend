@@ -1,274 +1,480 @@
 // ══════════════════════════════════════════════
-// سيرفر جوّك الخلفي — نسخة Duffel + تحويل عملة تلقائي لجنيه مصري
-// وظيفته: يستقبل طلب بحث من الموقع، ينادي Duffel API بمفتاحك السري
-// (اللي محدش يقدر يشوفه لأنه هنا في السيرفر مش في المتصفح)، يجيب أسعار حقيقية،
-// يحوّلهم لجنيه مصري، ويرجعهم للموقع.
-//
-// ملاحظة: انتقلنا من Amadeus لـ Duffel لأن بوابة Amadeus Self-Service
-// اتقفلت رسمياً في يوليو 2026. Duffel بديل مباشر ومناسب لنفس الغرض.
+// سيرفر جوّك الخلفي — Launch Ready
+// Duffel + تحويل عملة إلى EGP + تحقق من السعر قبل تأكيد الطلب
 // ══════════════════════════════════════════════
 import express from 'express';
 import cors from 'cors';
 import 'dotenv/config';
 
 const app = express();
-app.use(cors());
-app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const DUFFEL_TOKEN = process.env.DUFFEL_ACCESS_TOKEN;
 const DUFFEL_BASE = 'https://api.duffel.com';
-// Duffel بتحدد إصدار الـ API برقم تاريخ ثابت في الهيدر (مش في الرابط)
 const DUFFEL_API_VERSION = 'v2';
+const FRONTEND_URL = process.env.FRONTEND_URL || '';
 
-// ══════════════════════════════════════════════
-// إعدادات التسعير — غيّرهم من هنا لو حبيت تعدّل النسب لاحقاً
-// ══════════════════════════════════════════════
-// تكلفة تدبير العملة (تحويل جنيه لدولار للدفع) — تكلفة حقيقية عليك، مش ربح
-const CURRENCY_FEE_PERCENT = 3; // %
-// هامش ربحك، بيتحط فوق التكلفة الحقيقية (بعد تدبير العملة)
-const PROFIT_MARGIN_PERCENT = 5; // %
+// حد زمني لحماية السيرفر من الطلبات المعلقة.
+const DUFFEL_TIMEOUT_MS = 20_000;
+const FX_TIMEOUT_MS = 10_000;
 
-// عدد الرحلات المعروضة للعميل
-const MAX_RESULTS = 30;
+// التسعير
+const CURRENCY_FEE_PERCENT = 3;
+const PROFIT_MARGIN_PERCENT = 5;
+const MAX_RESULTS = 80;
+
+// حدود البحث
+const MAX_ADULTS = 9;
+const MAX_CHILDREN = 8;
+const MAX_INFANTS = 9;
+const IATA_RE = /^[A-Z]{3}$/;
+const CABINS = new Set(['economy', 'premium_economy', 'business', 'first']);
+
+// Rate limit بسيط داخل الذاكرة — مناسب للـlaunch، ويعاد ضبطه مع restart.
+const RATE_WINDOW_MS = 60_000;
+const RATE_MAX_REQUESTS = 30;
+const rateBuckets = new Map();
+
+app.use(cors({
+  origin(origin, callback) {
+    // الطلبات بدون Origin (مثل health checks) مسموحة.
+    if (!origin) return callback(null, true);
+    if (!FRONTEND_URL) return callback(null, true);
+    const allowed = FRONTEND_URL.split(',').map(v => v.trim()).filter(Boolean);
+    return callback(null, allowed.includes(origin));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+}));
+
+app.use(express.json({ limit: '50kb' }));
+
+function getClientIp(req) {
+  return String(req.headers['x-forwarded-for'] || req.ip || 'unknown')
+    .split(',')[0]
+    .trim();
+}
+
+function rateLimit(req, res, next) {
+  const now = Date.now();
+  const key = getClientIp(req);
+  let bucket = rateBuckets.get(key);
+
+  if (!bucket || now - bucket.startedAt >= RATE_WINDOW_MS) {
+    bucket = { startedAt: now, count: 0 };
+    rateBuckets.set(key, bucket);
+  }
+
+  bucket.count += 1;
+
+  if (bucket.count > RATE_MAX_REQUESTS) {
+    const retryAfter = Math.ceil(
+      (RATE_WINDOW_MS - (now - bucket.startedAt)) / 1000
+    );
+
+    res.set('Retry-After', String(retryAfter));
+
+    return res.status(429).json({
+      error: 'طلبات كثيرة خلال وقت قصير. حاول مرة أخرى بعد قليل.'
+    });
+  }
+
+  // منع نمو الـMap بلا حدود.
+  if (rateBuckets.size > 5000) {
+    for (const [ip, item] of rateBuckets) {
+      if (now - item.startedAt >= RATE_WINDOW_MS) {
+        rateBuckets.delete(ip);
+      }
+    }
+  }
+
+  next();
+}
 
 function duffelHeaders() {
   return {
-    'Authorization': `Bearer ${DUFFEL_TOKEN}`,
+    Authorization: `Bearer ${DUFFEL_TOKEN}`,
     'Duffel-Version': DUFFEL_API_VERSION,
     'Content-Type': 'application/json',
-    'Accept': 'application/json',
+    Accept: 'application/json',
   };
 }
 
+async function fetchWithTimeout(
+  url,
+  options = {},
+  timeoutMs = DUFFEL_TIMEOUT_MS
+) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(
+        'انتهت مهلة الاتصال بالمصدر. حاول البحث مرة أخرى.'
+      );
+    }
+
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ══════════════════════════════════════════════
-// تحويل العملة — بنجيب سعر الصرف من مصدر مجاني (fawazahmed0/currency-api عبر jsDelivr)
-// وبنخزنه مؤقتاً لمدة ساعة عشان منطلبوش من غير داعي في كل عملية بحث
+// تحويل العملة
 // ══════════════════════════════════════════════
-let ratesCache = { rates: null, fetchedAt: 0 };
-const RATES_CACHE_MS = 60 * 60 * 1000; // ساعة واحدة
+
+let ratesCache = {
+  rates: null,
+  fetchedAt: 0
+};
+
+const RATES_CACHE_MS = 60 * 60 * 1000;
 
 async function getExchangeRates() {
   const now = Date.now();
 
-  if (ratesCache.rates && (now - ratesCache.fetchedAt) < RATES_CACHE_MS) {
+  if (
+    ratesCache.rates &&
+    now - ratesCache.fetchedAt < RATES_CACHE_MS
+  ) {
     return ratesCache.rates;
   }
 
-  // بنجيب أسعار صرف USD لكل العملات دفعة واحدة (بيشمل EGP وEUR وGBP...)
-  const url = 'https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json';
-  const res = await fetch(url);
+  const url =
+    'https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json';
+
+  const res = await fetchWithTimeout(
+    url,
+    {},
+    FX_TIMEOUT_MS
+  );
 
   if (!res.ok) {
-    throw new Error('تعذر جلب أسعار الصرف');
+    throw new Error('تعذر جلب أسعار الصرف حالياً');
   }
 
   const data = await res.json();
 
   if (!data?.usd || typeof data.usd !== 'object') {
-    throw new Error('بيانات أسعار الصرف غير صالحة حالياً');
+    throw new Error(
+      'بيانات أسعار الصرف غير صالحة حالياً'
+    );
   }
 
-  // شكل الرد:
-  // { date: "...", usd: { egp: 48.5, eur: 0.92, gbp: 0.79, ... } }
   ratesCache = {
     rates: data.usd,
-    fetchedAt: now,
+    fetchedAt: now
   };
 
   return ratesCache.rates;
 }
 
-// ══════════════════════════════════════════════
-// تحويل مبلغ من عملة معينة لجنيه مصري
-// ══════════════════════════════════════════════
 async function convertToEGP(amount, fromCurrency) {
   const numericAmount = Number(amount);
 
-  if (!Number.isFinite(numericAmount) || numericAmount < 0) {
+  if (
+    !Number.isFinite(numericAmount) ||
+    numericAmount < 0
+  ) {
     throw new Error('قيمة السعر الأصلية غير صالحة');
   }
 
-  const cur = (fromCurrency || 'USD').toLowerCase();
+  const cur = String(
+    fromCurrency || 'USD'
+  ).toLowerCase();
 
-  // لو السعر أصلاً بالجنيه المصري
-  if (cur === 'egp') return numericAmount;
+  if (cur === 'egp') {
+    return numericAmount;
+  }
 
   const rates = await getExchangeRates();
 
   const egpPerUsd = Number(rates.egp);
 
-  if (!Number.isFinite(egpPerUsd) || egpPerUsd <= 0) {
-    throw new Error('سعر صرف الجنيه المصري غير متاح حالياً');
+  if (
+    !Number.isFinite(egpPerUsd) ||
+    egpPerUsd <= 0
+  ) {
+    throw new Error(
+      'سعر صرف الجنيه المصري غير متاح حالياً'
+    );
   }
 
-  // USD → EGP
   if (cur === 'usd') {
     return numericAmount * egpPerUsd;
   }
 
-  // لو العملة مش USD (مثلاً EUR):
-  // مبلغ بالعملة دي → USD → EGP
   const currencyPerUsd = Number(rates[cur]);
 
-  if (!Number.isFinite(currencyPerUsd) || currencyPerUsd <= 0) {
-    throw new Error(`سعر صرف ${fromCurrency} غير متاح حالياً`);
+  if (
+    !Number.isFinite(currencyPerUsd) ||
+    currencyPerUsd <= 0
+  ) {
+    throw new Error(
+      `سعر صرف ${fromCurrency} غير متاح حالياً`
+    );
   }
 
-  const amountInUsd = numericAmount / currencyPerUsd;
-  const amountInEGP = amountInUsd * egpPerUsd;
+  const amountInEGP =
+    (numericAmount / currencyPerUsd) * egpPerUsd;
 
-  if (!Number.isFinite(amountInEGP) || amountInEGP < 0) {
-    throw new Error('تعذر حساب السعر بالجنيه المصري');
+  if (
+    !Number.isFinite(amountInEGP) ||
+    amountInEGP < 0
+  ) {
+    throw new Error(
+      'تعذر حساب السعر بالجنيه المصري'
+    );
   }
 
   return amountInEGP;
 }
 
-// ══════════════════════════════════════════════
-// تطبيق تكلفة تدبير العملة وهامش الربح فوق السعر بالجنيه
-// الترتيب مهم: تدبير العملة أولاً (تكلفة حقيقية)، وبعدين هامش الربح فوقها
-// ══════════════════════════════════════════════
 function applyPricing(egpAmount) {
   const numericAmount = Number(egpAmount);
 
-  if (!Number.isFinite(numericAmount) || numericAmount < 0) {
-    throw new Error('قيمة السعر بالجنيه غير صالحة');
+  if (
+    !Number.isFinite(numericAmount) ||
+    numericAmount < 0
+  ) {
+    throw new Error(
+      'قيمة السعر بالجنيه غير صالحة'
+    );
   }
 
   const afterCurrencyFee =
-    numericAmount * (1 + CURRENCY_FEE_PERCENT / 100);
+    numericAmount *
+    (1 + CURRENCY_FEE_PERCENT / 100);
 
   const afterMargin =
-    afterCurrencyFee * (1 + PROFIT_MARGIN_PERCENT / 100);
+    afterCurrencyFee *
+    (1 + PROFIT_MARGIN_PERCENT / 100);
 
-  if (!Number.isFinite(afterMargin) || afterMargin < 0) {
-    throw new Error('تعذر حساب السعر النهائي');
+  if (
+    !Number.isFinite(afterMargin) ||
+    afterMargin < 0
+  ) {
+    throw new Error(
+      'تعذر حساب السعر النهائي'
+    );
   }
 
   return afterMargin;
 }
 
-// ══════════════════════════════════════════════
-// نقطة البحث عن رحلات — دي اللي الموقع هينادي عليها
-// ══════════════════════════════════════════════
-app.post('/api/search-flights', async (req, res) => {
-  try {
-    const {
+function parseNonNegativeInt(
+  value,
+  fallback = 0
+) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ''
+  ) {
+    return fallback;
+  }
+
+  if (!/^[0-9]+$/.test(String(value))) {
+    return NaN;
+  }
+
+  return Number(value);
+}
+
+function validateSearchBody(body = {}) {
+  const from = String(body.from || '')
+    .trim()
+    .toUpperCase();
+
+  const to = String(body.to || '')
+    .trim()
+    .toUpperCase();
+
+  const departDate = String(
+    body.departDate || ''
+  ).trim();
+
+  const returnDate = body.returnDate
+    ? String(body.returnDate).trim()
+    : '';
+
+  if (
+    !IATA_RE.test(from) ||
+    !IATA_RE.test(to)
+  ) {
+    return {
+      error: 'بيانات المطارات غير صالحة.'
+    };
+  }
+
+  if (from === to) {
+    return {
+      error:
+        'مدينة المغادرة والوصول يجب أن تكونا مختلفتين.'
+    };
+  }
+
+  const dep = new Date(
+    `${departDate}T00:00:00Z`
+  );
+
+  if (
+    !/^\d{4}-\d{2}-\d{2}$/.test(departDate) ||
+    Number.isNaN(dep.getTime())
+  ) {
+    return {
+      error: 'تاريخ السفر غير صالح.'
+    };
+  }
+
+  if (returnDate) {
+    const ret = new Date(
+      `${returnDate}T00:00:00Z`
+    );
+
+    if (
+      !/^\d{4}-\d{2}-\d{2}$/.test(returnDate) ||
+      Number.isNaN(ret.getTime())
+    ) {
+      return {
+        error: 'تاريخ العودة غير صالح.'
+      };
+    }
+
+    if (ret < dep) {
+      return {
+        error:
+          'تاريخ العودة يجب أن يكون بعد أو مساويًا لتاريخ الذهاب.'
+      };
+    }
+  }
+
+  const adults = parseNonNegativeInt(
+    body.adults,
+    1
+  );
+
+  const children = parseNonNegativeInt(
+    body.children,
+    0
+  );
+
+  const infants = parseNonNegativeInt(
+    body.infants,
+    0
+  );
+
+  if (
+    ![adults, children, infants].every(
+      Number.isInteger
+    )
+  ) {
+    return {
+      error: 'عدد المسافرين غير صالح.'
+    };
+  }
+
+  if (
+    adults < 1 ||
+    adults > MAX_ADULTS
+  ) {
+    return {
+      error:
+        `عدد البالغين يجب أن يكون بين 1 و${MAX_ADULTS}.`
+    };
+  }
+
+  if (
+    children < 0 ||
+    children > MAX_CHILDREN
+  ) {
+    return {
+      error:
+        `عدد الأطفال يجب ألا يتجاوز ${MAX_CHILDREN}.`
+    };
+  }
+
+  if (
+    infants < 0 ||
+    infants > MAX_INFANTS ||
+    infants > adults
+  ) {
+    return {
+      error:
+        'عدد الرضع يجب ألا يتجاوز عدد البالغين.'
+    };
+  }
+
+  const cabin = String(
+    body.cabin || 'economy'
+  ).toLowerCase();
+
+  if (!CABINS.has(cabin)) {
+    return {
+      error: 'درجة السفر غير صالحة.'
+    };
+  }
+
+  return {
+    value: {
       from,
       to,
       departDate,
       returnDate,
-      adults = 1,
-      children = 0,
-      cabin = 'economy'
-    } = req.body;
-
-    if (!from || !to || !departDate) {
-      return res.status(400).json({
-        error: 'محتاج تحدد نقطة الانطلاق والوصول وتاريخ السفر'
-      });
+      adults,
+      children,
+      infants,
+      cabin
     }
-
-    // بناء قائمة المسافرين (Duffel بتطلبهم كمصفوفة كائنات)
-    const passengers = [];
-
-    for (let i = 0; i < Number(adults); i++) {
-      passengers.push({ type: 'adult' });
-    }
-
-    for (let i = 0; i < Number(children); i++) {
-      passengers.push({ type: 'child' });
-    }
-
-    // بناء المسارات (slices) — رحلة ذهاب، وذهاب وعودة لو فيه returnDate
-    const slices = [
-      {
-        origin: from,
-        destination: to,
-        departure_date: departDate
-      },
-    ];
-
-    if (returnDate) {
-      slices.push({
-        origin: to,
-        destination: from,
-        departure_date: returnDate
-      });
-    }
-
-    // الخطوة 1: إنشاء "طلب عرض أسعار" (Offer Request)
-    const offerReqRes = await fetch(
-      `${DUFFEL_BASE}/air/offer_requests?return_offers=true`,
-      {
-        method: 'POST',
-        headers: duffelHeaders(),
-        body: JSON.stringify({
-          data: {
-            slices,
-            passengers,
-            cabin_class: cabin.toLowerCase(),
-          },
-        }),
-      }
-    );
-
-    if (!offerReqRes.ok) {
-      const errBody = await offerReqRes.json().catch(() => ({}));
-
-      return res.status(offerReqRes.status).json({
-        error: 'حصل خطأ في جلب الرحلات من Duffel',
-        details: errBody,
-      });
-    }
-
-    const offerReqData = await offerReqRes.json();
-    const offers = offerReqData.data?.offers || [];
-
-    const formatted = await formatDuffelResults(offers);
-
-    res.json({
-      flights: formatted,
-      count: formatted.length,
-      currency: 'EGP'
-    });
-
-  } catch (err) {
-    console.error(err);
-
-    res.status(500).json({
-      error: err.message || 'حصل خطأ غير متوقع'
-    });
-  }
-});
-
-// ══════════════════════════════════════════════
-// استخراج بيانات الأمتعة الحقيقية من العرض
-// Duffel بترجع الأمتعة المسموحة لكل راكب/سيجمنت داخل passengers[].baggages[]
-// ══════════════════════════════════════════════
-function extractBaggageInfo(firstSegment) {
-  const passengerData = firstSegment.passengers?.[0];
-  const baggages = passengerData?.baggages || [];
-
-  const checked = baggages.find(b => b.type === 'checked');
-  const carryOn = baggages.find(b => b.type === 'carry_on');
-
-  return {
-    checkedIncluded: Boolean(checked && checked.quantity > 0),
-    checkedQuantity: checked?.quantity || 0,
-    carryOnIncluded: Boolean(carryOn && carryOn.quantity > 0),
-    carryOnQuantity: carryOn?.quantity || 0,
   };
 }
 
-// ══════════════════════════════════════════════
-// استخراج شروط الاسترداد الحقيقية من العرض
-// Duffel بترجعها في conditions.refund_before_departure.allowed
-// لو الحقل مش موجود خالص، معناه المعلومة غير مؤكدة من شركة الطيران
-// ══════════════════════════════════════════════
+function extractBaggageInfo(firstSegment) {
+  const passengerData =
+    firstSegment?.passengers?.[0];
+
+  const baggages =
+    passengerData?.baggages || [];
+
+  const checked = baggages.find(
+    b => b.type === 'checked'
+  );
+
+  const carryOn = baggages.find(
+    b => b.type === 'carry_on'
+  );
+
+  return {
+    checkedIncluded:
+      Boolean(
+        checked &&
+        Number(checked.quantity) > 0
+      ),
+
+    checkedQuantity:
+      Number(checked?.quantity || 0),
+
+    carryOnIncluded:
+      Boolean(
+        carryOn &&
+        Number(carryOn.quantity) > 0
+      ),
+
+    carryOnQuantity:
+      Number(carryOn?.quantity || 0),
+  };
+}
+
 function extractRefundInfo(offer) {
-  const refundCond = offer.conditions?.refund_before_departure;
+  const refundCond =
+    offer?.conditions?.refund_before_departure;
 
   if (!refundCond) {
     return {
@@ -279,240 +485,288 @@ function extractRefundInfo(offer) {
   }
 
   return {
-    refundable: Boolean(refundCond.allowed),
-    penaltyAmount: refundCond.penalty_amount
-      ? Number(refundCond.penalty_amount)
-      : 0,
-    penaltyCurrency: refundCond.penalty_currency || null,
+    refundable:
+      Boolean(refundCond.allowed),
+
+    penaltyAmount:
+      refundCond.penalty_amount
+        ? Number(refundCond.penalty_amount)
+        : 0,
+
+    penaltyCurrency:
+      refundCond.penalty_currency || null,
   };
 }
 
-// ══════════════════════════════════════════════
-// تحويل رد Duffel المعقد لشكل بسيط يفهمه الموقع
-// مع تحويل السعر لجنيه مصري
-// ══════════════════════════════════════════════
-async function formatDuffelResults(offers) {
+async function formatDuffelOffer(offer) {
+  if (
+    !offer?.slices?.length ||
+    !offer.slices[0]?.segments?.length
+  ) {
+    throw new Error(
+      'عرض الرحلة غير مكتمل'
+    );
+  }
 
-  // بنحسب سعر كل العروض أولاً
-  const results = await Promise.all(
-    offers.map(async (offer) => {
+  const firstSlice =
+    offer.slices[0];
 
-      try {
-        const firstSlice = offer.slices[0];
-        const firstSegment = firstSlice.segments[0];
-        const lastSegment =
-          firstSlice.segments[firstSlice.segments.length - 1];
+  const firstSegment =
+    firstSlice.segments[0];
 
-        const stops = firstSlice.segments.length - 1;
+  const lastSegment =
+    firstSlice.segments[
+      firstSlice.segments.length - 1
+    ];
 
-        const originalAmount = Number(offer.total_amount);
-        const originalCurrency = offer.total_currency;
+  const originalAmount =
+    Number(offer.total_amount);
 
-        // لازم السعر الأصلي يكون رقم صحيح وموجب
-        if (
-          !Number.isFinite(originalAmount) ||
-          originalAmount < 0 ||
-          !originalCurrency
-        ) {
-          throw new Error(
-            `بيانات السعر الأصلية غير صالحة للعرض ${offer.id || 'unknown'}`
-          );
+  const originalCurrency =
+    offer.total_currency;
+
+  if (
+    !Number.isFinite(originalAmount) ||
+    originalAmount < 0 ||
+    !originalCurrency
+  ) {
+    throw new Error(
+      `بيانات السعر الأصلية غير صالحة للعرض ${offer.id || 'unknown'}`
+    );
+  }
+
+  const rawEGP =
+    await convertToEGP(
+      originalAmount,
+      originalCurrency
+    );
+
+  const finalPrice =
+    Math.round(
+      applyPricing(rawEGP)
+    );
+
+  if (
+    !Number.isFinite(finalPrice) ||
+    finalPrice < 0
+  ) {
+    throw new Error(
+      'السعر النهائي غير صالح'
+    );
+  }
+
+  const baggage =
+    extractBaggageInfo(
+      firstSegment
+    );
+
+  const refund =
+    extractRefundInfo(offer);
+
+  const operatingCarrier =
+    firstSegment.operating_carrier;
+
+  const marketingCarrier =
+    firstSegment.marketing_carrier;
+
+  const displayCarrier =
+    operatingCarrier ||
+    marketingCarrier;
+
+  let returnLeg = null;
+
+  if (
+    offer.slices.length > 1 &&
+    offer.slices[1]?.segments?.length
+  ) {
+    const retSlice =
+      offer.slices[1];
+
+    const retFirstSeg =
+      retSlice.segments[0];
+
+    const retLastSeg =
+      retSlice.segments[
+        retSlice.segments.length - 1
+      ];
+
+    const returnCarrier =
+      retFirstSeg.operating_carrier ||
+      retFirstSeg.marketing_carrier;
+
+    returnLeg = {
+      from:
+        retFirstSeg.origin?.iata_code,
+
+      to:
+        retLastSeg.destination?.iata_code,
+
+      depTime:
+        String(
+          retFirstSeg.departing_at || ''
+        ).slice(11, 16),
+
+      arrTime:
+        String(
+          retLastSeg.arriving_at || ''
+        ).slice(11, 16),
+
+      duration:
+        String(
+          retSlice.duration || ''
+        )
+          .replace('PT', '')
+          .toLowerCase(),
+
+      stops:
+        Math.max(
+          0,
+          retSlice.segments.length - 1
+        ),
+
+      flightNumber:
+        (returnCarrier?.iata_code || '') +
+        (
+          retFirstSeg.operating_carrier_flight_number ||
+          retFirstSeg.marketing_carrier_flight_number ||
+          ''
+        ),
+    };
+  }
+
+  return {
+    id: offer.id,
+
+    airlineCode:
+      displayCarrier?.iata_code || '',
+
+    airlineName:
+      displayCarrier?.name ||
+      'شركة طيران',
+
+    flightNumber:
+      (displayCarrier?.iata_code || '') +
+      (
+        firstSegment.operating_carrier_flight_number ||
+        firstSegment.marketing_carrier_flight_number ||
+        ''
+      ),
+
+    from:
+      firstSegment.origin?.iata_code,
+
+    to:
+      lastSegment.destination?.iata_code,
+
+    depTime:
+      String(
+        firstSegment.departing_at || ''
+      ).slice(11, 16),
+
+    arrTime:
+      String(
+        firstSegment.arriving_at || ''
+      ).slice(11, 16),
+
+    duration:
+      String(
+        firstSlice.duration || ''
+      )
+        .replace('PT', '')
+        .toLowerCase(),
+
+    stops:
+      Math.max(
+        0,
+        firstSlice.segments.length - 1
+      ),
+
+    returnLeg,
+
+    price: finalPrice,
+
+    currency: 'EGP',
+
+    originalPrice:
+      Math.round(originalAmount),
+
+    originalCurrency,
+
+    // لا نخترع رقم مقاعد إذا Duffel لم توفره.
+    seatsLeft:
+      firstSegment.available_seats ?? null,
+
+    cabin:
+      firstSegment.passengers?.[0]
+        ?.cabin_class_marketing_name ||
+      'economy',
+
+    baggage,
+
+    refundable:
+      refund.refundable,
+
+    refundPenalty:
+      refund.penaltyAmount,
+
+    refundPenaltyCurrency:
+      refund.penaltyCurrency,
+  };
+}
+
+async function formatDuffelResults(
+  offers
+) {
+  const results =
+    await Promise.all(
+      offers.map(
+        async offer => {
+          try {
+            return await formatDuffelOffer(
+              offer
+            );
+          } catch (e) {
+            console.error(
+              `تم استبعاد عرض بسبب مشكلة في السعر: ${offer?.id || 'unknown'} — ${e.message}`
+            );
+
+            return null;
+          }
         }
+      )
+    );
 
-        // تحويل السعر الحقيقي إلى EGP
-        const rawEGP = await convertToEGP(
-          originalAmount,
-          originalCurrency
-        );
-
-        // تطبيق 3% تكلفة تدبير + 5% هامش ربح
-        const finalPrice = applyPricing(rawEGP);
-
-        // السعر النهائي بالجنيه
-        const priceEGP = Math.round(finalPrice);
-
-        // حماية إضافية: ممنوع نرجع سعر غير صالح
-        if (!Number.isFinite(priceEGP) || priceEGP < 0) {
-          throw new Error(
-            `السعر النهائي غير صالح للعرض ${offer.id || 'unknown'}`
-          );
-        }
-
-        const baggage = extractBaggageInfo(firstSegment);
-        const refund = extractRefundInfo(offer);
-
-        // تحديد شركة الطيران من الـ segment نفسه
-        // بدل offer.owner، عشان تظهر شركة التشغيل الفعلية
-        // مثل flynas / flyadeal بدل شركة الـ owner مثل Hahn Air
-        const operatingCarrier = firstSegment.operating_carrier;
-        const marketingCarrier = firstSegment.marketing_carrier;
-        const displayCarrier =
-          operatingCarrier || marketingCarrier;
-
-        // لو فيه رحلة عودة (slice تاني)، نستخرج بياناتها بنفس الطريقة
-        let returnLeg = null;
-
-        if (offer.slices.length > 1) {
-          const retSlice = offer.slices[1];
-          const retFirstSeg = retSlice.segments[0];
-          const retLastSeg =
-            retSlice.segments[retSlice.segments.length - 1];
-
-          const returnCarrier =
-            retFirstSeg.operating_carrier ||
-            retFirstSeg.marketing_carrier;
-
-          returnLeg = {
-            from: retFirstSeg.origin?.iata_code,
-            to: retLastSeg.destination?.iata_code,
-            depTime: (
-              retFirstSeg.departing_at || ''
-            ).slice(11, 16),
-            arrTime: (
-              retFirstSeg.arriving_at || ''
-            ).slice(11, 16),
-            duration: (
-              retSlice.duration || ''
-            ).replace('PT', '').toLowerCase(),
-            stops: retSlice.segments.length - 1,
-            flightNumber:
-              (returnCarrier?.iata_code || '') +
-              (
-                retFirstSeg.operating_carrier_flight_number ||
-                retFirstSeg.marketing_carrier_flight_number ||
-                ''
-              ),
-          };
-        }
-
-        return {
-          id: offer.id,
-
-          airlineCode:
-            displayCarrier?.iata_code || '',
-
-          airlineName:
-            displayCarrier?.name || 'شركة طيران',
-
-          flightNumber:
-            (displayCarrier?.iata_code || '') +
-            (
-              firstSegment.operating_carrier_flight_number ||
-              firstSegment.marketing_carrier_flight_number ||
-              ''
-            ),
-
-          from:
-            firstSegment.origin?.iata_code,
-
-          to:
-            lastSegment.destination?.iata_code,
-
-          depTime:
-            (firstSegment.departing_at || '').slice(11, 16),
-
-          arrTime:
-            (lastSegment.arriving_at || '').slice(11, 16),
-
-          duration:
-            (firstSlice.duration || '')
-              .replace('PT', '')
-              .toLowerCase(),
-
-          stops,
-
-          returnLeg,
-
-          // السعر النهائي بعد التحويل والتسعير
-          price: priceEGP,
-          currency: 'EGP',
-
-          // السعر الأصلي كما رجع من Duffel
-          originalPrice: Math.round(originalAmount),
-          originalCurrency,
-
-          seatsLeft:
-            firstSegment.available_seats ?? 9,
-
-          cabin:
-            firstSegment.passengers?.[0]
-              ?.cabin_class_marketing_name || 'economy',
-
-          // بيانات حقيقية من Duffel — مش قيم ثابتة
-          baggage: {
-            checkedIncluded:
-              baggage.checkedIncluded,
-
-            checkedQuantity:
-              baggage.checkedQuantity,
-
-            carryOnIncluded:
-              baggage.carryOnIncluded,
-
-            carryOnQuantity:
-              baggage.carryOnQuantity,
-          },
-
-          refundable:
-            refund.refundable,
-
-          refundPenalty:
-            refund.penaltyAmount,
-
-          refundPenaltyCurrency:
-            refund.penaltyCurrency,
-        };
-
-      } catch (e) {
-
-        // مهم جداً:
-        // لو فشل تحويل العملة أو حساب السعر،
-        // لا نعرض السعر الأصلي للعميل كأنه EGP.
-        // بدلاً من ذلك يتم استبعاد هذا العرض فقط.
-        console.error(
-          `تم استبعاد عرض بسبب مشكلة في السعر: ${
-            offer.id || 'unknown'
-          } — ${e.message}`
-        );
-
-        return null;
-      }
-    })
-  );
-
-  // نشيل العروض اللي فشل حساب سعرها
-  // ونرتب كل الرحلات من الأرخص للأغلى أولاً
-  const sortedResults = results
-    .filter(Boolean)
-    .sort((a, b) => a.price - b.price);
-
-  // ══════════════════════════════════════════════
-  // التوزيع الذكي الديناميكي
-  //
-  // مفيش عدد ثابت للرحلات من أي شركة.
-  //
-  // السعر يفضل العامل الأساسي، لكن لما شركة تظهر
-  // بشكل متكرر جداً، ندي أفضلية بسيطة للرحلات من
-  // شركات أخرى طالما فرق السعر معقول.
-  //
-  // الهدف:
-  // أرخص الرحلات + تنوع طبيعي في شركات الطيران.
-  // ══════════════════════════════════════════════
+  const sortedResults =
+    results
+      .filter(Boolean)
+      .sort(
+        (a, b) =>
+          a.price - b.price
+      );
 
   const selectedResults = [];
-  const remainingResults = [...sortedResults];
-  const airlineCounts = new Map();
+
+  const remainingResults =
+    [...sortedResults];
+
+  const airlineCounts =
+    new Map();
 
   while (
-    selectedResults.length < MAX_RESULTS &&
-    remainingResults.length > 0
+    selectedResults.length <
+      MAX_RESULTS &&
+    remainingResults.length
   ) {
-
     let bestIndex = 0;
     let bestScore = Infinity;
 
-    for (let i = 0; i < remainingResults.length; i++) {
-      const flight = remainingResults[i];
+    for (
+      let i = 0;
+      i < remainingResults.length;
+      i++
+    ) {
+      const flight =
+        remainingResults[i];
 
       const airlineKey =
         flight.airlineCode ||
@@ -520,18 +774,16 @@ async function formatDuffelResults(offers) {
         'unknown';
 
       const airlineCount =
-        airlineCounts.get(airlineKey) || 0;
+        airlineCounts.get(
+          airlineKey
+        ) || 0;
 
-      // كلما زاد ظهور نفس الشركة،
-      // تزيد عقوبة التكرار تدريجياً.
-      //
-      // العقوبة نسبتها من السعر، لذلك الرحلة الأرخص
-      // تظل لها أفضلية واضحة، ولا يتم استبعادها لمجرد التنوع.
       const diversityPenalty =
         airlineCount * 0.025;
 
       const score =
-        flight.price * (1 + diversityPenalty);
+        flight.price *
+        (1 + diversityPenalty);
 
       if (score < bestScore) {
         bestScore = score;
@@ -540,7 +792,10 @@ async function formatDuffelResults(offers) {
     }
 
     const selectedFlight =
-      remainingResults.splice(bestIndex, 1)[0];
+      remainingResults.splice(
+        bestIndex,
+        1
+      )[0];
 
     const airlineKey =
       selectedFlight.airlineCode ||
@@ -549,64 +804,389 @@ async function formatDuffelResults(offers) {
 
     airlineCounts.set(
       airlineKey,
-      (airlineCounts.get(airlineKey) || 0) + 1
+      (
+        airlineCounts.get(
+          airlineKey
+        ) || 0
+      ) + 1
     );
 
-    selectedResults.push(selectedFlight);
+    selectedResults.push(
+      selectedFlight
+    );
   }
 
-  // نرتب النتائج النهائية من الأرخص للأغلى
-  // عشان العميل يفضل شايف السعر الأرخص في البداية.
-  return selectedResults
-    .sort((a, b) => a.price - b.price);
+  return selectedResults.sort(
+    (a, b) =>
+      a.price - b.price
+  );
+}
+
+function duffelErrorMessage(
+  status
+) {
+  if (status === 400) {
+    return 'بيانات البحث غير مقبولة من مزود الرحلات. راجع بيانات الرحلة وحاول مرة أخرى.';
+  }
+
+  if (
+    status === 401 ||
+    status === 403
+  ) {
+    return 'تعذر الاتصال بمصدر الرحلات. يرجى المحاولة لاحقاً.';
+  }
+
+  if (status === 429) {
+    return 'مصدر الرحلات مشغول حالياً. حاول مرة أخرى بعد قليل.';
+  }
+
+  if (status >= 500) {
+    return 'مصدر الرحلات غير متاح مؤقتاً. حاول مرة أخرى بعد قليل.';
+  }
+
+  return 'حصل خطأ في جلب الرحلات. حاول مرة أخرى.';
 }
 
 // ══════════════════════════════════════════════
-// نقطة صحة السيرفر — للتأكد إنه شغال
+// البحث
 // ══════════════════════════════════════════════
-app.get('/api/health', async (req, res) => {
-  let ratesOk = false;
-  let egpRate = null;
 
-  try {
-    const rates = await getExchangeRates();
+app.post(
+  '/api/search-flights',
+  rateLimit,
+  async (req, res) => {
+    try {
+      if (!DUFFEL_TOKEN) {
+        return res.status(503).json({
+          error:
+            'خدمة البحث غير مهيأة حالياً.'
+        });
+      }
 
-    egpRate = rates.egp;
-    ratesOk = Boolean(egpRate);
+      const validation =
+        validateSearchBody(
+          req.body
+        );
 
-  } catch (e) {
-    ratesOk = false;
+      if (validation.error) {
+        return res.status(400).json({
+          error:
+            validation.error
+        });
+      }
+
+      const {
+        from,
+        to,
+        departDate,
+        returnDate,
+        adults,
+        children,
+        infants,
+        cabin
+      } = validation.value;
+
+      const passengers = [];
+
+      for (
+        let i = 0;
+        i < adults;
+        i++
+      ) {
+        passengers.push({
+          type: 'adult'
+        });
+      }
+
+      for (
+        let i = 0;
+        i < children;
+        i++
+      ) {
+        passengers.push({
+          type: 'child'
+        });
+      }
+
+      for (
+        let i = 0;
+        i < infants;
+        i++
+      ) {
+        passengers.push({
+          type:
+            'infant_without_seat'
+        });
+      }
+
+      const slices = [
+        {
+          origin: from,
+          destination: to,
+          departure_date:
+            departDate
+        }
+      ];
+
+      if (returnDate) {
+        slices.push({
+          origin: to,
+          destination: from,
+          departure_date:
+            returnDate
+        });
+      }
+
+      const offerReqRes =
+        await fetchWithTimeout(
+          `${DUFFEL_BASE}/air/offer_requests?return_offers=true&supplier_timeout=10000`,
+          {
+            method: 'POST',
+
+            headers:
+              duffelHeaders(),
+
+            body: JSON.stringify({
+              data: {
+                slices,
+                passengers,
+                cabin_class:
+                  cabin,
+              },
+            }),
+          }
+        );
+
+      if (!offerReqRes.ok) {
+        console.error(
+          'Duffel search error:',
+          offerReqRes.status
+        );
+
+        return res.status(502).json({
+          error:
+            duffelErrorMessage(
+              offerReqRes.status
+            )
+        });
+      }
+
+      const offerReqData =
+        await offerReqRes.json();
+
+      const offers =
+        offerReqData.data?.offers ||
+        [];
+
+      const formatted =
+        await formatDuffelResults(
+          offers
+        );
+
+      return res.json({
+        flights: formatted,
+        count: formatted.length,
+        currency: 'EGP'
+      });
+
+    } catch (err) {
+      console.error(err);
+
+      const status =
+        err?.message?.includes(
+          'انتهت مهلة'
+        )
+          ? 504
+          : 500;
+
+      return res.status(status).json({
+        error:
+          status === 504
+            ? err.message
+            : 'تعذر إكمال البحث حالياً. حاول مرة أخرى.'
+      });
+    }
   }
+);
 
-  res.json({
-    status: 'ok',
+// ══════════════════════════════════════════════
+// إعادة التحقق من العرض قبل إرسال العميل لواتساب
+// ══════════════════════════════════════════════
 
-    duffelConfigured:
-      Boolean(DUFFEL_TOKEN),
+app.post(
+  '/api/verify-offer',
+  rateLimit,
+  async (req, res) => {
+    try {
+      if (!DUFFEL_TOKEN) {
+        return res.status(503).json({
+          error:
+            'خدمة التحقق غير مهيأة حالياً.'
+        });
+      }
 
-    mode:
-      DUFFEL_TOKEN?.startsWith('duffel_test_')
-        ? 'test'
-        : (DUFFEL_TOKEN ? 'live' : 'not-configured'),
+      const offerId =
+        String(
+          req.body?.offerId || ''
+        ).trim();
 
-    currencyConversion:
-      ratesOk ? 'ok' : 'unavailable',
+      if (
+        !offerId ||
+        offerId.length > 200 ||
+        !/^off_[A-Za-z0-9_-]+$/.test(
+          offerId
+        )
+      ) {
+        return res.status(400).json({
+          error:
+            'معرّف الرحلة غير صالح.'
+        });
+      }
 
-    usdToEgpRate:
-      egpRate,
-  });
-});
+      const offerRes =
+        await fetchWithTimeout(
+          `${DUFFEL_BASE}/air/offers/${encodeURIComponent(offerId)}`,
+          {
+            method: 'GET',
+            headers:
+              duffelHeaders()
+          }
+        );
 
-app.listen(PORT, () => {
-  console.log(
-    `✅ سيرفر جوّك شغال على http://localhost:${PORT}`
-  );
+      if (!offerRes.ok) {
+        console.error(
+          'Duffel offer verification error:',
+          offerRes.status,
+          offerId
+        );
 
-  console.log(
-    `   مصدر البيانات: Duffel API`
-  );
+        return res
+          .status(
+            offerRes.status === 404
+              ? 409
+              : 502
+          )
+          .json({
+            error:
+              offerRes.status === 404
+                ? 'الرحلة لم تعد متاحة بنفس العرض. من فضلك أعد البحث للحصول على أحدث سعر.'
+                : duffelErrorMessage(
+                    offerRes.status
+                  )
+          });
+      }
 
-  console.log(
-    `   الأسعار بتترجع بالجنيه المصري (EGP) تلقائياً`
-  );
-});
+      const offerData =
+        await offerRes.json();
+
+      const offer =
+        offerData.data;
+
+      if (!offer) {
+        return res.status(409).json({
+          error:
+            'تعذر العثور على أحدث بيانات الرحلة.'
+        });
+      }
+
+      const formatted =
+        await formatDuffelOffer(
+          offer
+        );
+
+      return res.json({
+        flight: formatted,
+        verifiedAt:
+          new Date().toISOString()
+      });
+
+    } catch (err) {
+      console.error(err);
+
+      const status =
+        err?.message?.includes(
+          'انتهت مهلة'
+        )
+          ? 504
+          : 500;
+
+      return res.status(status).json({
+        error:
+          status === 504
+            ? err.message
+            : 'تعذر التحقق من السعر حالياً. حاول مرة أخرى.'
+      });
+    }
+  }
+);
+
+// ══════════════════════════════════════════════
+// Health Check
+// ══════════════════════════════════════════════
+
+app.get(
+  '/api/health',
+  async (req, res) => {
+    let ratesOk = false;
+    let egpRate = null;
+
+    try {
+      const rates =
+        await getExchangeRates();
+
+      egpRate =
+        Number(rates.egp) || null;
+
+      ratesOk =
+        Boolean(egpRate);
+
+    } catch (_) {}
+
+    res.json({
+      status: 'ok',
+
+      duffelConfigured:
+        Boolean(DUFFEL_TOKEN),
+
+      mode:
+        DUFFEL_TOKEN?.startsWith(
+          'duffel_test_'
+        )
+          ? 'test'
+          : (
+              DUFFEL_TOKEN
+                ? 'live'
+                : 'not-configured'
+            ),
+
+      currencyConversion:
+        ratesOk
+          ? 'ok'
+          : 'unavailable',
+
+      usdToEgpRate:
+        egpRate,
+    });
+  }
+);
+
+app.listen(
+  PORT,
+  () => {
+    console.log(
+      `✅ سيرفر جوّك شغال على port ${PORT}`
+    );
+
+    console.log(
+      '   مصدر البيانات: Duffel API'
+    );
+
+    console.log(
+      '   الأسعار بتترجع بالجنيه المصري EGP'
+    );
+
+    console.log(
+      '   Verify Offer مفعّل قبل تأكيد السعر'
+    );
+  }
+);
