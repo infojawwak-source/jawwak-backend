@@ -20,8 +20,8 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const EMAIL_FROM = process.env.EMAIL_FROM || '';
 const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || 'jawwak.eg@gmail.com';
 
-// Supabase — يستخدمه السيرفر فقط للوصول الآمن إلى حالات الحجوزات.
-const SUPABASE_URL = process.env.SUPABASE_URL || '';
+// متابعة حالة الحجوزات — المفتاح السري يظل على السيرفر فقط
+const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const STATUS_ADMIN_KEY = process.env.STATUS_ADMIN_KEY || '';
 
@@ -54,7 +54,7 @@ app.use(cors({
     return callback(null, allowed.includes(origin));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'X-Admin-Key'],
+  allowedHeaders: ['Content-Type'],
 }));
 
 app.use(express.json({ limit: '50kb' }));
@@ -1447,160 +1447,99 @@ app.post(
   }
 );
 
-// ══════════════════════════════════════════════
-// متابعة حالة الحجز — Status Tracking
-// العميل يرى الحالة فقط، بدون أي بيانات شخصية.
-// ══════════════════════════════════════════════
 
-const BOOKING_REF_RE = /^JWK-[A-Z0-9-]{4,100}$/i;
+// ══════════════════════════════════════════════
+// متابعة حالة الحجز
+// ══════════════════════════════════════════════
 const BOOKING_STATUSES = new Set([
   'pending',
   'awaiting_payment',
   'payment_sent',
   'confirmed',
-  'failed'
+  'cancelled',
 ]);
 
-const BOOKING_STATUS_LABELS = {
-  pending: 'جاري تأكيد الحجز',
-  awaiting_payment: 'في انتظار الدفع',
-  payment_sent: 'تم إرسال بيانات الدفع',
-  confirmed: 'تم تأكيد الحجز',
-  failed: 'تعذر إتمام الحجز'
-};
-
-async function supabaseRequest(path, options = {}) {
+async function supabaseRest(path, options = {}) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error('Supabase status service is not configured.');
+    throw new Error('خدمة متابعة الحجوزات غير مهيأة على السيرفر.');
   }
-
-  return fetchWithTimeout(
-    `${SUPABASE_URL.replace(/\/$/, '')}/rest/v1/${path}`,
-    {
-      ...options,
-      headers: {
-        apikey: SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        ...(options.headers || {})
-      }
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
     },
-    10_000
-  );
-}
-
-function normalizeBookingRef(value) {
-  return String(value || '').trim().toUpperCase();
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    console.error('Supabase status API error:', response.status, data);
+    throw new Error('تعذر الوصول إلى حالة الحجز حالياً.');
+  }
+  return data;
 }
 
 app.get('/api/booking-status', rateLimit, async (req, res) => {
   try {
-    const bookingRef = normalizeBookingRef(req.query?.bookingRef);
-
-    if (!BOOKING_REF_RE.test(bookingRef)) {
-      return res.status(400).json({
-        error: 'رقم الحجز غير صالح.'
-      });
+    const bookingRef = String(req.query?.bookingRef || '').trim().toUpperCase();
+    if (!/^JWK-[A-Z0-9-]{4,100}$/.test(bookingRef)) {
+      return res.status(400).json({ ok: false, error: 'رقم الطلب غير صالح.' });
     }
 
-    const response = await supabaseRequest(
-      `bookings?select=booking_ref,status&booking_ref=eq.${encodeURIComponent(bookingRef)}&limit=1`,
-      { method: 'GET' }
+    const rows = await supabaseRest(
+      `bookings?select=booking_ref,status&booking_ref=eq.${encodeURIComponent(bookingRef)}&limit=1`
     );
 
-    const data = await response.json().catch(() => []);
-
-    if (!response.ok) {
-      console.error('Booking status read error:', response.status, data);
-      return res.status(502).json({
-        error: 'تعذر قراءة حالة الحجز حالياً.'
-      });
-    }
-
-    const booking = Array.isArray(data) ? data[0] : null;
-
-    if (!booking) {
-      return res.status(404).json({
-        error: 'لم يتم العثور على حجز بهذا الرقم.'
-      });
-    }
-
-    const status = BOOKING_STATUSES.has(booking.status)
-      ? booking.status
-      : 'pending';
-
-    return res.json({
-      bookingRef: booking.booking_ref,
-      status,
-      label: BOOKING_STATUS_LABELS[status]
-    });
-  } catch (err) {
-    console.error('Booking status error:', err);
-    return res.status(500).json({
-      error: 'تعذر التحقق من حالة الحجز حالياً.'
-    });
-  }
-});
-
-app.post('/api/admin/verify', rateLimit, async (req, res) => {
-  const adminKey = String(req.headers['x-admin-key'] || '');
-
-  if (!STATUS_ADMIN_KEY || !adminKey || adminKey !== STATUS_ADMIN_KEY) {
-    return res.status(401).json({ error: 'بيانات الدخول غير صحيحة.' });
-  }
-
-  return res.json({ ok: true });
-});
-
-app.post('/api/admin/booking-status', rateLimit, async (req, res) => {
-  try {
-    const adminKey = String(req.headers['x-admin-key'] || '');
-
-    if (!STATUS_ADMIN_KEY || !adminKey || adminKey !== STATUS_ADMIN_KEY) {
-      return res.status(401).json({ error: 'غير مصرح.' });
-    }
-
-    const bookingRef = normalizeBookingRef(req.body?.bookingRef);
-    const status = String(req.body?.status || '').trim();
-
-    if (!BOOKING_REF_RE.test(bookingRef)) {
-      return res.status(400).json({ error: 'رقم الحجز غير صالح.' });
-    }
-
-    if (!BOOKING_STATUSES.has(status)) {
-      return res.status(400).json({ error: 'حالة الحجز غير صالحة.' });
-    }
-
-    const response = await supabaseRequest(
-      `bookings?booking_ref=eq.${encodeURIComponent(bookingRef)}`,
-      {
-        method: 'PATCH',
-        headers: { Prefer: 'return=minimal' },
-        body: JSON.stringify({ status })
-      }
-    );
-
-    const body = await response.text().catch(() => '');
-
-    if (!response.ok) {
-      console.error('Booking status update error:', response.status, body);
-      return res.status(502).json({
-        error: 'تعذر تحديث حالة الحجز.'
-      });
+    if (!Array.isArray(rows) || !rows.length) {
+      return res.status(404).json({ ok: false, error: 'لم نجد طلبًا بهذا الرقم. تأكد من كتابة رقم الطلب بشكل صحيح.' });
     }
 
     return res.json({
       ok: true,
-      bookingRef,
-      status,
-      label: BOOKING_STATUS_LABELS[status]
+      bookingRef: rows[0].booking_ref,
+      status: rows[0].status || 'pending',
     });
   } catch (err) {
-    console.error('Admin booking status error:', err);
-    return res.status(500).json({
-      error: 'تعذر تحديث حالة الحجز حالياً.'
-    });
+    console.error(err);
+    return res.status(500).json({ ok: false, error: err?.message || 'تعذر التحقق من حالة الطلب حالياً.' });
+  }
+});
+
+app.post('/api/admin/booking-status', rateLimit, async (req, res) => {
+  try {
+    if (!STATUS_ADMIN_KEY || String(req.headers['x-status-admin-key'] || '') !== STATUS_ADMIN_KEY) {
+      return res.status(401).json({ ok: false, error: 'غير مصرح.' });
+    }
+
+    const bookingRef = String(req.body?.bookingRef || '').trim().toUpperCase();
+    const status = String(req.body?.status || '').trim();
+
+    if (!/^JWK-[A-Z0-9-]{4,100}$/.test(bookingRef)) {
+      return res.status(400).json({ ok: false, error: 'رقم الطلب غير صالح.' });
+    }
+    if (!BOOKING_STATUSES.has(status)) {
+      return res.status(400).json({ ok: false, error: 'حالة الحجز غير صالحة.' });
+    }
+
+    const rows = await supabaseRest(
+      `bookings?booking_ref=eq.${encodeURIComponent(bookingRef)}`,
+      {
+        method: 'PATCH',
+        headers: { Prefer: 'return=representation' },
+        body: JSON.stringify({ status }),
+      }
+    );
+
+    if (!Array.isArray(rows) || !rows.length) {
+      return res.status(404).json({ ok: false, error: 'لم نجد طلبًا بهذا الرقم.' });
+    }
+
+    return res.json({ ok: true, bookingRef, status: rows[0].status });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ ok: false, error: err?.message || 'تعذر تحديث حالة الطلب.' });
   }
 });
 
@@ -1638,13 +1577,6 @@ app.get(
           EMAIL_FROM
         ),
 
-      statusTrackingConfigured:
-        Boolean(
-          SUPABASE_URL &&
-          SUPABASE_SERVICE_ROLE_KEY &&
-          STATUS_ADMIN_KEY
-        ),
-
       mode:
         DUFFEL_TOKEN?.startsWith(
           'duffel_test_'
@@ -1660,6 +1592,9 @@ app.get(
         ratesOk
           ? 'ok'
           : 'unavailable',
+
+      bookingStatusConfigured:
+        Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && STATUS_ADMIN_KEY),
 
       usdToEgpRate:
         egpRate,
