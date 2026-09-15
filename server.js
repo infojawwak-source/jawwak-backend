@@ -436,6 +436,59 @@ function validateSearchBody(body = {}) {
   };
 }
 
+// ══════════════════════════════════════════════
+// معلومات الحقائب
+// ══════════════════════════════════════════════
+
+function readWeightKg(bag) {
+  if (!bag || typeof bag !== 'object') {
+    return null;
+  }
+
+  const directCandidates = [
+    bag.weight_kg,
+    bag.weightKg,
+    bag.maximum_weight_kg,
+    bag.maximumWeightKg,
+    bag.weight?.kg,
+    bag.weight?.value,
+    bag.maximum_weight?.kg,
+    bag.maximum_weight?.value,
+  ];
+
+  for (const value of directCandidates) {
+    const n = Number(value);
+
+    if (
+      Number.isFinite(n) &&
+      n > 0
+    ) {
+      return n;
+    }
+  }
+
+  return null;
+}
+
+function readWeightUnit(bag) {
+  if (!bag || typeof bag !== 'object') {
+    return null;
+  }
+
+  const unit =
+    bag.weight_unit ||
+    bag.weightUnit ||
+    bag.weight?.unit ||
+    bag.maximum_weight_unit ||
+    bag.maximumWeightUnit ||
+    bag.maximum_weight?.unit ||
+    null;
+
+  return unit
+    ? String(unit).toLowerCase()
+    : null;
+}
+
 function extractBaggageInfo(firstSegment) {
   const passengerData =
     firstSegment?.passengers?.[0];
@@ -461,6 +514,12 @@ function extractBaggageInfo(firstSegment) {
     checkedQuantity:
       Number(checked?.quantity || 0),
 
+    checkedWeightKg:
+      readWeightKg(checked),
+
+    checkedWeightUnit:
+      readWeightUnit(checked),
+
     carryOnIncluded:
       Boolean(
         carryOn &&
@@ -469,6 +528,12 @@ function extractBaggageInfo(firstSegment) {
 
     carryOnQuantity:
       Number(carryOn?.quantity || 0),
+
+    carryOnWeightKg:
+      readWeightKg(carryOn),
+
+    carryOnWeightUnit:
+      readWeightUnit(carryOn),
   };
 }
 
@@ -665,7 +730,7 @@ async function formatDuffelOffer(offer) {
 
     arrTime:
       String(
-        firstSegment.arriving_at || ''
+        lastSegment.arriving_at || ''
       ).slice(11, 16),
 
     duration:
@@ -1045,7 +1110,7 @@ app.post(
 
       const offerRes =
         await fetchWithTimeout(
-          `${DUFFEL_BASE}/air/offers/${encodeURIComponent(offerId)}`,
+          `${DUFFEL_BASE}/air/offers/${encodeURIComponent(offerId)}?return_available_services=true`,
           {
             method: 'GET',
             headers:
