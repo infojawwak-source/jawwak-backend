@@ -23,7 +23,7 @@ const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || 'jawwak.eg@gmail.com';
 // متابعة حالة الحجوزات — المفتاح السري يظل على السيرفر فقط
 const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-const STATUS_ADMIN_KEY = process.env.STATUS_ADMIN_KEY || '';
+const ADMIN_PASSWORD = 'Jawwak@2026';
 
 // حد زمني لحماية السيرفر من الطلبات المعلقة.
 const DUFFEL_TIMEOUT_MS = 20_000;
@@ -54,7 +54,7 @@ app.use(cors({
     return callback(null, allowed.includes(origin));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type'],
+  allowedHeaders: ['Content-Type', 'X-Admin-Password'],
 }));
 
 app.use(express.json({ limit: '50kb' }));
@@ -1509,7 +1509,7 @@ app.get('/api/booking-status', rateLimit, async (req, res) => {
 
 app.post('/api/admin/booking-status', rateLimit, async (req, res) => {
   try {
-    if (!STATUS_ADMIN_KEY || String(req.headers['x-status-admin-key'] || '') !== STATUS_ADMIN_KEY) {
+    if (String(req.headers['x-admin-password'] || '') !== ADMIN_PASSWORD) {
       return res.status(401).json({ ok: false, error: 'غير مصرح.' });
     }
 
@@ -1594,7 +1594,7 @@ app.get(
           : 'unavailable',
 
       bookingStatusConfigured:
-        Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && STATUS_ADMIN_KEY),
+        Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY),
 
       usdToEgpRate:
         egpRate,
