@@ -1,6 +1,7 @@
 // ══════════════════════════════════════════════
 // سيرفر جوّك الخلفي — Launch Ready
 // Duffel + تحويل عملة إلى EGP + تحقق من السعر قبل تأكيد الطلب
+// + إرسال تأكيد الحجز عبر البريد الإلكتروني
 // ══════════════════════════════════════════════
 import express from 'express';
 import cors from 'cors';
@@ -13,6 +14,16 @@ const DUFFEL_TOKEN = process.env.DUFFEL_ACCESS_TOKEN;
 const DUFFEL_BASE = 'https://api.duffel.com';
 const DUFFEL_API_VERSION = 'v2';
 const FRONTEND_URL = process.env.FRONTEND_URL || '';
+
+// البريد الإلكتروني — ضع القيم في Render Environment Variables
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const EMAIL_FROM = process.env.EMAIL_FROM || '';
+const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || 'jawwak.eg@gmail.com';
+
+// Supabase — يستخدمه السيرفر فقط للوصول الآمن إلى حالات الحجوزات.
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const STATUS_ADMIN_KEY = process.env.STATUS_ADMIN_KEY || '';
 
 // حد زمني لحماية السيرفر من الطلبات المعلقة.
 const DUFFEL_TIMEOUT_MS = 20_000;
@@ -37,14 +48,13 @@ const rateBuckets = new Map();
 
 app.use(cors({
   origin(origin, callback) {
-    // الطلبات بدون Origin (مثل health checks) مسموحة.
     if (!origin) return callback(null, true);
     if (!FRONTEND_URL) return callback(null, true);
     const allowed = FRONTEND_URL.split(',').map(v => v.trim()).filter(Boolean);
     return callback(null, allowed.includes(origin));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type'],
+  allowedHeaders: ['Content-Type', 'X-Admin-Key'],
 }));
 
 app.use(express.json({ limit: '50kb' }));
@@ -79,7 +89,6 @@ function rateLimit(req, res, next) {
     });
   }
 
-  // منع نمو الـMap بلا حدود.
   if (rateBuckets.size > 5000) {
     for (const [ip, item] of rateBuckets) {
       if (now - item.startedAt >= RATE_WINDOW_MS) {
@@ -436,59 +445,6 @@ function validateSearchBody(body = {}) {
   };
 }
 
-// ══════════════════════════════════════════════
-// معلومات الحقائب
-// ══════════════════════════════════════════════
-
-function readWeightKg(bag) {
-  if (!bag || typeof bag !== 'object') {
-    return null;
-  }
-
-  const directCandidates = [
-    bag.weight_kg,
-    bag.weightKg,
-    bag.maximum_weight_kg,
-    bag.maximumWeightKg,
-    bag.weight?.kg,
-    bag.weight?.value,
-    bag.maximum_weight?.kg,
-    bag.maximum_weight?.value,
-  ];
-
-  for (const value of directCandidates) {
-    const n = Number(value);
-
-    if (
-      Number.isFinite(n) &&
-      n > 0
-    ) {
-      return n;
-    }
-  }
-
-  return null;
-}
-
-function readWeightUnit(bag) {
-  if (!bag || typeof bag !== 'object') {
-    return null;
-  }
-
-  const unit =
-    bag.weight_unit ||
-    bag.weightUnit ||
-    bag.weight?.unit ||
-    bag.maximum_weight_unit ||
-    bag.maximumWeightUnit ||
-    bag.maximum_weight?.unit ||
-    null;
-
-  return unit
-    ? String(unit).toLowerCase()
-    : null;
-}
-
 function extractBaggageInfo(firstSegment) {
   const passengerData =
     firstSegment?.passengers?.[0];
@@ -514,12 +470,6 @@ function extractBaggageInfo(firstSegment) {
     checkedQuantity:
       Number(checked?.quantity || 0),
 
-    checkedWeightKg:
-      readWeightKg(checked),
-
-    checkedWeightUnit:
-      readWeightUnit(checked),
-
     carryOnIncluded:
       Boolean(
         carryOn &&
@@ -528,12 +478,6 @@ function extractBaggageInfo(firstSegment) {
 
     carryOnQuantity:
       Number(carryOn?.quantity || 0),
-
-    carryOnWeightKg:
-      readWeightKg(carryOn),
-
-    carryOnWeightUnit:
-      readWeightUnit(carryOn),
   };
 }
 
@@ -757,7 +701,6 @@ async function formatDuffelOffer(offer) {
 
     originalCurrency,
 
-    // لا نخترع رقم مقاعد إذا Duffel لم توفره.
     seatsLeft:
       firstSegment.available_seats ?? null,
 
@@ -1075,7 +1018,7 @@ app.post(
 );
 
 // ══════════════════════════════════════════════
-// إعادة التحقق من العرض قبل إرسال العميل لواتساب
+// إعادة التحقق من العرض قبل تأكيد الطلب
 // ══════════════════════════════════════════════
 
 app.post(
@@ -1110,7 +1053,7 @@ app.post(
 
       const offerRes =
         await fetchWithTimeout(
-          `${DUFFEL_BASE}/air/offers/${encodeURIComponent(offerId)}?return_available_services=true`,
+          `${DUFFEL_BASE}/air/offers/${encodeURIComponent(offerId)}`,
           {
             method: 'GET',
             headers:
@@ -1186,6 +1129,482 @@ app.post(
 );
 
 // ══════════════════════════════════════════════
+// إرسال تفاصيل الحجز بالبريد الإلكتروني
+// ══════════════════════════════════════════════
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function validEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function formatEmailPrice(value) {
+  const n = Number(value);
+  return Number.isFinite(n)
+    ? `${Math.round(n).toLocaleString('en-US')} جنيه مصري`
+    : 'غير متاح';
+}
+
+function formatEmailDate(value) {
+  if (!value) return '—';
+  const m = String(value).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return escapeHtml(value);
+  const d = new Date(`${value}T12:00:00`);
+  if (Number.isNaN(d.getTime())) return escapeHtml(value);
+  return d.toLocaleDateString('ar-EG', { weekday:'long', year:'numeric', month:'long', day:'numeric' });
+}
+
+function flightEmailHtml({ bookingRef, customer, flight, paymentMethods }) {
+  const returnLeg = flight?.returnLeg;
+
+  const paymentHtml = (Array.isArray(paymentMethods) && paymentMethods.length
+    ? paymentMethods
+    : ['Instapay', 'تحويل بنكي', 'Vodafone Cash', 'Fawry']
+  ).map(method => `<li style="margin:0 0 8px">${escapeHtml(method)}</li>`).join('');
+
+  const returnHtml = returnLeg ? `
+    <tr>
+      <td style="padding:10px 0;color:#667085">العودة</td>
+      <td style="padding:10px 0;font-weight:700">
+        ${escapeHtml(flight?.returnDate ? formatEmailDate(flight.returnDate) : '')}<br>${escapeHtml(returnLeg.from || '')} → ${escapeHtml(returnLeg.to || '')}
+        &nbsp; ${escapeHtml(returnLeg.depTime || '')} - ${escapeHtml(returnLeg.arrTime || '')}
+      </td>
+    </tr>
+  ` : '';
+
+  return `
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head><meta charset="utf-8"></head>
+<body style="margin:0;background:#f5f7fb;font-family:Arial,Tahoma,sans-serif;color:#172033">
+  <div style="max-width:680px;margin:30px auto;padding:0 14px">
+    <div style="background:#0a1a3f;border-radius:22px 22px 0 0;padding:26px;text-align:center;color:#fff">
+      <div style="font-size:28px;font-weight:800">جوّك ✈️</div>
+      <div style="margin-top:7px;font-size:14px;opacity:.85">تأكيد استلام طلب الحجز</div>
+    </div>
+
+    <div style="background:#fff;padding:28px;border-radius:0 0 22px 22px">
+      <h2 style="margin:0 0 12px;font-size:21px">مرحباً ${escapeHtml(customer.name)}</h2>
+      <p style="line-height:1.9;color:#475467;margin:0 0 22px">
+        تم استلام طلب الحجز بنجاح. السعر الظاهر أمامك هو السعر النهائي للرحلة.
+        فيما يلي تفاصيل الرحلة وطرق إتمام الحجز المتاحة.
+      </p>
+
+      <div style="background:#f8fafc;border:1px solid #e4e7ec;border-radius:16px;padding:18px;margin-bottom:18px">
+        <div style="font-size:13px;color:#667085">رقم الطلب</div>
+        <div style="font-size:20px;font-weight:800;margin-top:5px">${escapeHtml(bookingRef)}</div>
+      </div>
+
+      <div style="border:1px solid #e4e7ec;border-radius:16px;padding:18px;margin-bottom:18px">
+        <h3 style="margin:0 0 12px">تفاصيل الرحلة</h3>
+        <table style="width:100%;border-collapse:collapse;font-size:14px">
+          <tr>
+            <td style="padding:10px 0;color:#667085">شركة الطيران</td>
+            <td style="padding:10px 0;font-weight:700">${escapeHtml(flight?.airlineName || 'شركة طيران')}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 0;color:#667085">رقم الرحلة</td>
+            <td style="padding:10px 0;font-weight:700">${escapeHtml(flight?.flightNumber || '')}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 0;color:#667085">تاريخ الذهاب</td>
+            <td style="padding:10px 0;font-weight:700">${formatEmailDate(flight?.departDate)}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 0;color:#667085">الذهاب</td>
+            <td style="padding:10px 0;font-weight:700">
+              ${escapeHtml(flight?.from || '')} → ${escapeHtml(flight?.to || '')}
+              &nbsp; ${escapeHtml(flight?.depTime || '')} - ${escapeHtml(flight?.arrTime || '')}
+            </td>
+          </tr>
+          ${returnHtml}
+          <tr>
+            <td style="padding:10px 0;color:#667085">الدرجة</td>
+            <td style="padding:10px 0;font-weight:700">${escapeHtml(flight?.cabin || 'اقتصادي')}</td>
+          </tr>
+        </table>
+      </div>
+
+      <div style="background:#eef6ff;border:1px solid #cfe2ff;border-radius:16px;padding:20px;margin-bottom:18px">
+        <div style="font-size:13px;color:#475467">السعر النهائي للرحلة</div>
+        <div style="font-size:27px;font-weight:900;margin-top:5px">${formatEmailPrice(flight?.price)}</div>
+        <div style="font-size:12px;color:#667085;margin-top:6px">شامل الرسوم وفق السعر المعروض أثناء الحجز.</div>
+      </div>
+
+      <div style="border:1px solid #e4e7ec;border-radius:16px;padding:18px;margin-bottom:18px">
+        <h3 style="margin:0 0 10px">طرق الحجز والدفع المتاحة</h3>
+        <ul style="padding-right:22px;line-height:1.8;margin:8px 0">${paymentHtml}</ul>
+        <p style="color:#667085;font-size:13px;line-height:1.8;margin:12px 0 0">
+          للمتابعة، يمكنك الرد على هذا البريد الإلكتروني، وسيتابع فريق جوّك معك خطوات إتمام الحجز.
+        </p>
+      </div>
+
+      <div style="color:#667085;font-size:13px;line-height:1.8">
+        <strong>بيانات التواصل:</strong><br>
+        الهاتف: ${escapeHtml(customer.phone)}<br>
+        البريد الإلكتروني: ${escapeHtml(customer.email)}
+      </div>
+
+      <div style="border-top:1px solid #eaecf0;margin-top:24px;padding-top:18px;text-align:center;color:#98a2b3;font-size:12px">
+        جوّك — رحلتك تبدأ من هنا ✈️
+      </div>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+async function sendResendEmail({ to, subject, html, replyTo, idempotencyKey }) {
+  if (!RESEND_API_KEY || !EMAIL_FROM) {
+    throw new Error(
+      'خدمة البريد الإلكتروني غير مهيأة حالياً.'
+    );
+  }
+
+  const body = {
+    from: EMAIL_FROM,
+    to: [to],
+    subject,
+    html,
+  };
+
+  if (replyTo) {
+    body.reply_to = replyTo;
+  }
+
+  const response = await fetchWithTimeout(
+    'https://api.resend.com/emails',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+      },
+      body: JSON.stringify(body),
+    },
+    15_000
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    console.error('Resend email error:', response.status, data);
+
+    throw new Error(
+      'تعذر إرسال البريد الإلكتروني حالياً.'
+    );
+  }
+
+  return data;
+}
+
+app.post(
+  '/api/send-booking-email',
+  rateLimit,
+  async (req, res) => {
+    try {
+      const bookingRef =
+        String(req.body?.bookingRef || '').trim();
+
+      const searchId =
+        String(req.body?.searchId || '').trim();
+
+      const customer =
+        req.body?.customer || {};
+
+      const customerName =
+        String(customer.name || '').trim();
+
+      const customerPhone =
+        String(customer.phone || '').trim();
+
+      const customerEmail =
+        normalizeEmail(customer.email);
+
+      const flight =
+        req.body?.flight || {};
+
+      const paymentMethods =
+        Array.isArray(req.body?.paymentMethods)
+          ? req.body.paymentMethods
+          : ['Instapay', 'تحويل بنكي', 'Vodafone Cash', 'Fawry'];
+
+      if (
+        !bookingRef ||
+        bookingRef.length > 100
+      ) {
+        return res.status(400).json({
+          error: 'رقم الطلب غير صالح.'
+        });
+      }
+
+      if (
+        !customerName ||
+        customerName.length > 150
+      ) {
+        return res.status(400).json({
+          error: 'اسم العميل غير صالح.'
+        });
+      }
+
+      if (
+        !customerPhone ||
+        customerPhone.length > 50
+      ) {
+        return res.status(400).json({
+          error: 'رقم الهاتف غير صالح.'
+        });
+      }
+
+      if (
+        !customerEmail ||
+        customerEmail.length > 200 ||
+        !validEmail(customerEmail)
+      ) {
+        return res.status(400).json({
+          error: 'البريد الإلكتروني غير صالح.'
+        });
+      }
+
+      if (
+        !flight?.id ||
+        !flight?.airlineName ||
+        !flight?.from ||
+        !flight?.to
+      ) {
+        return res.status(400).json({
+          error: 'بيانات الرحلة غير مكتملة.'
+        });
+      }
+
+      if (
+        !Number.isFinite(Number(flight.price)) ||
+        Number(flight.price) < 0
+      ) {
+        return res.status(400).json({
+          error: 'سعر الرحلة غير صالح.'
+        });
+      }
+
+      const emailData = {
+        bookingRef,
+        searchId,
+        customer: {
+          name: customerName,
+          phone: customerPhone,
+          email: customerEmail,
+        },
+        flight,
+        paymentMethods,
+      };
+
+      const customerHtml =
+        flightEmailHtml(emailData);
+
+      const subject =
+        `جوّك — تفاصيل طلب الحجز ${bookingRef}`;
+
+      const result =
+        await sendResendEmail({
+          to: customerEmail,
+          subject,
+          html: customerHtml,
+          replyTo: EMAIL_REPLY_TO || undefined,
+          idempotencyKey: `jawwak-booking-${bookingRef}`,
+        });
+
+      // يتم إرسال إيميل واحد فقط إلى العميل.
+
+      return res.json({
+        ok: true,
+        bookingRef,
+        emailId: result?.id || null,
+        sentTo: customerEmail,
+      });
+
+    } catch (err) {
+      console.error(err);
+
+      return res.status(500).json({
+        error:
+          err?.message ||
+          'تعذر إرسال تفاصيل الحجز بالبريد الإلكتروني حالياً.'
+      });
+    }
+  }
+);
+
+// ══════════════════════════════════════════════
+// متابعة حالة الحجز — Status Tracking
+// العميل يرى الحالة فقط، بدون أي بيانات شخصية.
+// ══════════════════════════════════════════════
+
+const BOOKING_REF_RE = /^JWK-[A-Z0-9-]{4,100}$/i;
+const BOOKING_STATUSES = new Set([
+  'pending',
+  'awaiting_payment',
+  'payment_sent',
+  'confirmed',
+  'failed'
+]);
+
+const BOOKING_STATUS_LABELS = {
+  pending: 'جاري تأكيد الحجز',
+  awaiting_payment: 'في انتظار الدفع',
+  payment_sent: 'تم إرسال بيانات الدفع',
+  confirmed: 'تم تأكيد الحجز',
+  failed: 'تعذر إتمام الحجز'
+};
+
+async function supabaseRequest(path, options = {}) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('Supabase status service is not configured.');
+  }
+
+  return fetchWithTimeout(
+    `${SUPABASE_URL.replace(/\/$/, '')}/rest/v1/${path}`,
+    {
+      ...options,
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...(options.headers || {})
+      }
+    },
+    10_000
+  );
+}
+
+function normalizeBookingRef(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+app.get('/api/booking-status', rateLimit, async (req, res) => {
+  try {
+    const bookingRef = normalizeBookingRef(req.query?.bookingRef);
+
+    if (!BOOKING_REF_RE.test(bookingRef)) {
+      return res.status(400).json({
+        error: 'رقم الحجز غير صالح.'
+      });
+    }
+
+    const response = await supabaseRequest(
+      `bookings?select=booking_ref,status&booking_ref=eq.${encodeURIComponent(bookingRef)}&limit=1`,
+      { method: 'GET' }
+    );
+
+    const data = await response.json().catch(() => []);
+
+    if (!response.ok) {
+      console.error('Booking status read error:', response.status, data);
+      return res.status(502).json({
+        error: 'تعذر قراءة حالة الحجز حالياً.'
+      });
+    }
+
+    const booking = Array.isArray(data) ? data[0] : null;
+
+    if (!booking) {
+      return res.status(404).json({
+        error: 'لم يتم العثور على حجز بهذا الرقم.'
+      });
+    }
+
+    const status = BOOKING_STATUSES.has(booking.status)
+      ? booking.status
+      : 'pending';
+
+    return res.json({
+      bookingRef: booking.booking_ref,
+      status,
+      label: BOOKING_STATUS_LABELS[status]
+    });
+  } catch (err) {
+    console.error('Booking status error:', err);
+    return res.status(500).json({
+      error: 'تعذر التحقق من حالة الحجز حالياً.'
+    });
+  }
+});
+
+app.post('/api/admin/verify', rateLimit, async (req, res) => {
+  const adminKey = String(req.headers['x-admin-key'] || '');
+
+  if (!STATUS_ADMIN_KEY || !adminKey || adminKey !== STATUS_ADMIN_KEY) {
+    return res.status(401).json({ error: 'بيانات الدخول غير صحيحة.' });
+  }
+
+  return res.json({ ok: true });
+});
+
+app.post('/api/admin/booking-status', rateLimit, async (req, res) => {
+  try {
+    const adminKey = String(req.headers['x-admin-key'] || '');
+
+    if (!STATUS_ADMIN_KEY || !adminKey || adminKey !== STATUS_ADMIN_KEY) {
+      return res.status(401).json({ error: 'غير مصرح.' });
+    }
+
+    const bookingRef = normalizeBookingRef(req.body?.bookingRef);
+    const status = String(req.body?.status || '').trim();
+
+    if (!BOOKING_REF_RE.test(bookingRef)) {
+      return res.status(400).json({ error: 'رقم الحجز غير صالح.' });
+    }
+
+    if (!BOOKING_STATUSES.has(status)) {
+      return res.status(400).json({ error: 'حالة الحجز غير صالحة.' });
+    }
+
+    const response = await supabaseRequest(
+      `bookings?booking_ref=eq.${encodeURIComponent(bookingRef)}`,
+      {
+        method: 'PATCH',
+        headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({ status })
+      }
+    );
+
+    const body = await response.text().catch(() => '');
+
+    if (!response.ok) {
+      console.error('Booking status update error:', response.status, body);
+      return res.status(502).json({
+        error: 'تعذر تحديث حالة الحجز.'
+      });
+    }
+
+    return res.json({
+      ok: true,
+      bookingRef,
+      status,
+      label: BOOKING_STATUS_LABELS[status]
+    });
+  } catch (err) {
+    console.error('Admin booking status error:', err);
+    return res.status(500).json({
+      error: 'تعذر تحديث حالة الحجز حالياً.'
+    });
+  }
+});
+
+// ══════════════════════════════════════════════
 // Health Check
 // ══════════════════════════════════════════════
 
@@ -1212,6 +1631,19 @@ app.get(
 
       duffelConfigured:
         Boolean(DUFFEL_TOKEN),
+
+      emailConfigured:
+        Boolean(
+          RESEND_API_KEY &&
+          EMAIL_FROM
+        ),
+
+      statusTrackingConfigured:
+        Boolean(
+          SUPABASE_URL &&
+          SUPABASE_SERVICE_ROLE_KEY &&
+          STATUS_ADMIN_KEY
+        ),
 
       mode:
         DUFFEL_TOKEN?.startsWith(
@@ -1252,6 +1684,10 @@ app.listen(
 
     console.log(
       '   Verify Offer مفعّل قبل تأكيد السعر'
+    );
+
+    console.log(
+      `   Email service: ${RESEND_API_KEY && EMAIL_FROM ? 'configured' : 'not configured'}`
     );
   }
 );
