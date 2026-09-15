@@ -20,10 +20,12 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const EMAIL_FROM = process.env.EMAIL_FROM || '';
 const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || 'jawwak.eg@gmail.com';
 
-// متابعة حالة الحجوزات — المفتاح السري يظل على السيرفر فقط
-const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-const ADMIN_PASSWORD = 'Jawwak@2026';
+// Supabase — يُستخدم من السيرفر فقط (لا يتم إرساله للمتصفح).
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || '';
+
+// لوحة التحكم — نحتفظ بكلمة المرور الحالية، ويمكن تغييرها لاحقاً عبر Render Environment باسم ADMIN_PASSWORD.
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'Jawwak@2026';
 
 // حد زمني لحماية السيرفر من الطلبات المعلقة.
 const DUFFEL_TIMEOUT_MS = 20_000;
@@ -46,14 +48,22 @@ const RATE_WINDOW_MS = 60_000;
 const RATE_MAX_REQUESTS = 30;
 const rateBuckets = new Map();
 
+const DEFAULT_ALLOWED_ORIGINS = new Set([
+  'https://jawwak-eg.com',
+  'https://www.jawwak-eg.com',
+  'https://info-jawwak.workers.dev',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+]);
+
 app.use(cors({
   origin(origin, callback) {
     if (!origin) return callback(null, true);
-    if (!FRONTEND_URL) return callback(null, true);
-    const allowed = FRONTEND_URL.split(',').map(v => v.trim()).filter(Boolean);
-    return callback(null, allowed.includes(origin));
+    const configured = FRONTEND_URL.split(',').map(v => v.trim()).filter(Boolean);
+    const allowed = new Set([...DEFAULT_ALLOWED_ORIGINS, ...configured]);
+    return callback(null, allowed.has(origin));
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Admin-Password'],
 }));
 
@@ -1447,99 +1457,202 @@ app.post(
   }
 );
 
+// ══════════════════════════════════════════════
+// متابعة حالة الحجز + لوحة الإدارة
+// ══════════════════════════════════════════════
 
-// ══════════════════════════════════════════════
-// متابعة حالة الحجز
-// ══════════════════════════════════════════════
+const BOOKING_STATUS_LABELS = {
+  pending: '🟡 جاري تأكيد الحجز',
+  awaiting_payment: '🟠 في انتظار الدفع',
+  payment_sent: '🔵 تم إرسال بيانات الدفع',
+  confirmed: '🟢 تم تأكيد الحجز',
+  failed: '🔴 تعذر إتمام الحجز',
+  cancelled: '🔴 تعذر إتمام الحجز'
+};
+
 const BOOKING_STATUSES = new Set([
   'pending',
   'awaiting_payment',
   'payment_sent',
   'confirmed',
-  'cancelled',
+  'failed',
+  'cancelled'
 ]);
+
+const BOOKING_REF_RE = /^JWK-[A-Z0-9-]{4,100}$/i;
+
+function normalizeBookingRef(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function isAdminPasswordValid(req) {
+  const supplied = String(req.headers['x-admin-password'] || '');
+  return Boolean(ADMIN_PASSWORD && supplied && supplied === ADMIN_PASSWORD);
+}
 
 async function supabaseRest(path, options = {}) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error('خدمة متابعة الحجوزات غير مهيأة على السيرفر.');
+    throw new Error('Supabase status service is not configured.');
   }
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-    ...options,
-    headers: {
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      ...(options.headers || {}),
+
+  return fetchWithTimeout(
+    `${SUPABASE_URL.replace(/\/$/, '')}/rest/v1/${path}`,
+    {
+      ...options,
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...(options.headers || {})
+      }
     },
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    console.error('Supabase status API error:', response.status, data);
-    throw new Error('تعذر الوصول إلى حالة الحجز حالياً.');
-  }
-  return data;
+    10_000
+  );
 }
 
 app.get('/api/booking-status', rateLimit, async (req, res) => {
   try {
-    const bookingRef = String(req.query?.bookingRef || '').trim().toUpperCase();
-    if (!/^JWK-[A-Z0-9-]{4,100}$/.test(bookingRef)) {
-      return res.status(400).json({ ok: false, error: 'رقم الطلب غير صالح.' });
+    const bookingRef = normalizeBookingRef(req.query?.bookingRef);
+
+    if (!BOOKING_REF_RE.test(bookingRef)) {
+      return res.status(400).json({ error: 'رقم الحجز غير صالح.' });
     }
 
-    const rows = await supabaseRest(
-      `bookings?select=booking_ref,status&booking_ref=eq.${encodeURIComponent(bookingRef)}&limit=1`
+    const response = await supabaseRest(
+      `bookings?select=booking_ref,status&booking_ref=eq.${encodeURIComponent(bookingRef)}&limit=1`,
+      { method: 'GET' }
     );
 
-    if (!Array.isArray(rows) || !rows.length) {
-      return res.status(404).json({ ok: false, error: 'لم نجد طلبًا بهذا الرقم. تأكد من كتابة رقم الطلب بشكل صحيح.' });
+    const data = await response.json().catch(() => []);
+
+    if (!response.ok) {
+      console.error('Booking status read error:', response.status, data);
+      return res.status(502).json({ error: 'تعذر قراءة حالة الحجز حالياً.' });
     }
 
+    const booking = Array.isArray(data) ? data[0] : null;
+
+    if (!booking) {
+      return res.status(404).json({ error: 'لم يتم العثور على حجز بهذا الرقم.' });
+    }
+
+    const status = BOOKING_STATUSES.has(String(booking.status || ''))
+      ? String(booking.status)
+      : 'pending';
+
     return res.json({
-      ok: true,
-      bookingRef: rows[0].booking_ref,
-      status: rows[0].status || 'pending',
+      bookingRef: booking.booking_ref,
+      status,
+      label: BOOKING_STATUS_LABELS[status] || BOOKING_STATUS_LABELS.pending
     });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ ok: false, error: err?.message || 'تعذر التحقق من حالة الطلب حالياً.' });
+    console.error('Booking status error:', err);
+    return res.status(500).json({ error: 'تعذر التحقق من حالة الحجز حالياً.' });
+  }
+});
+
+app.post('/api/admin/verify', rateLimit, async (req, res) => {
+  if (!isAdminPasswordValid(req)) {
+    return res.status(401).json({ error: 'بيانات الدخول غير صحيحة.' });
+  }
+  return res.json({ ok: true });
+});
+
+app.get('/api/admin/bookings', rateLimit, async (req, res) => {
+  try {
+    if (!isAdminPasswordValid(req)) {
+      return res.status(401).json({ error: 'غير مصرح.' });
+    }
+
+    const response = await supabaseRest(
+      'bookings?select=*&order=created_at.desc',
+      { method: 'GET' }
+    );
+    const data = await response.json().catch(() => []);
+
+    if (!response.ok) {
+      console.error('Admin bookings read error:', response.status, data);
+      return res.status(502).json({ error: 'تعذر تحميل الحجوزات من قاعدة البيانات.' });
+    }
+
+    return res.json({ bookings: Array.isArray(data) ? data : [] });
+  } catch (err) {
+    console.error('Admin bookings error:', err);
+    return res.status(500).json({ error: 'تعذر تحميل الحجوزات حالياً.' });
+  }
+});
+
+app.get('/api/admin/contacts', rateLimit, async (req, res) => {
+  try {
+    if (!isAdminPasswordValid(req)) {
+      return res.status(401).json({ error: 'غير مصرح.' });
+    }
+
+    const response = await supabaseRest(
+      'contact_requests?select=*&order=created_at.desc',
+      { method: 'GET' }
+    );
+    const data = await response.json().catch(() => []);
+
+    if (!response.ok) {
+      console.error('Admin contacts read error:', response.status, data);
+      return res.status(502).json({ error: 'تعذر تحميل طلبات التواصل.' });
+    }
+
+    return res.json({ contacts: Array.isArray(data) ? data : [] });
+  } catch (err) {
+    console.error('Admin contacts error:', err);
+    return res.status(500).json({ error: 'تعذر تحميل طلبات التواصل حالياً.' });
   }
 });
 
 app.post('/api/admin/booking-status', rateLimit, async (req, res) => {
   try {
-    if (String(req.headers['x-admin-password'] || '') !== ADMIN_PASSWORD) {
-      return res.status(401).json({ ok: false, error: 'غير مصرح.' });
+    if (!isAdminPasswordValid(req)) {
+      return res.status(401).json({ error: 'غير مصرح.' });
     }
 
-    const bookingRef = String(req.body?.bookingRef || '').trim().toUpperCase();
-    const status = String(req.body?.status || '').trim();
+    const bookingRef = normalizeBookingRef(req.body?.bookingRef);
+    const status = String(req.body?.status || '').trim().toLowerCase();
 
-    if (!/^JWK-[A-Z0-9-]{4,100}$/.test(bookingRef)) {
-      return res.status(400).json({ ok: false, error: 'رقم الطلب غير صالح.' });
+    if (!BOOKING_REF_RE.test(bookingRef)) {
+      return res.status(400).json({ error: 'رقم الحجز غير صالح.' });
     }
+
     if (!BOOKING_STATUSES.has(status)) {
-      return res.status(400).json({ ok: false, error: 'حالة الحجز غير صالحة.' });
+      return res.status(400).json({ error: 'حالة الحجز غير صالحة.' });
     }
 
-    const rows = await supabaseRest(
+    const response = await supabaseRest(
       `bookings?booking_ref=eq.${encodeURIComponent(bookingRef)}`,
       {
         method: 'PATCH',
         headers: { Prefer: 'return=representation' },
-        body: JSON.stringify({ status }),
+        body: JSON.stringify({ status })
       }
     );
 
-    if (!Array.isArray(rows) || !rows.length) {
-      return res.status(404).json({ ok: false, error: 'لم نجد طلبًا بهذا الرقم.' });
+    const data = await response.json().catch(() => []);
+
+    if (!response.ok) {
+      console.error('Admin booking status update error:', response.status, data);
+      return res.status(502).json({ error: 'تعذر تحديث حالة الحجز في قاعدة البيانات.' });
     }
 
-    return res.json({ ok: true, bookingRef, status: rows[0].status });
+    if (!Array.isArray(data) || !data.length) {
+      return res.status(404).json({ error: 'لم يتم العثور على حجز بهذا الرقم.' });
+    }
+
+    return res.json({
+      ok: true,
+      bookingRef,
+      status,
+      label: BOOKING_STATUS_LABELS[status]
+    });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ ok: false, error: err?.message || 'تعذر تحديث حالة الطلب.' });
+    console.error('Admin booking status error:', err);
+    return res.status(500).json({ error: 'تعذر تحديث حالة الحجز حالياً.' });
   }
 });
 
@@ -1592,9 +1705,6 @@ app.get(
         ratesOk
           ? 'ok'
           : 'unavailable',
-
-      bookingStatusConfigured:
-        Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY),
 
       usdToEgpRate:
         egpRate,
