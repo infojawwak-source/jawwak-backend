@@ -1222,10 +1222,10 @@ function extractNotePreference(notes, label) {
 
 app.get('/api/booking-tracking', rateLimit, async (req, res) => {
   try {
-    const bookingRef = String(req.query?.bookingRef || '').trim();
+    const bookingRef = String(req.query?.bookingRef || '').trim().toUpperCase();
 
-    if (!bookingRef || bookingRef.length > 100) {
-      return res.status(400).json({ error: 'رقم الطلب غير صالح.' });
+    if (!/^JWK-[0-9]{6}-[A-Z0-9]{6}$/.test(bookingRef)) {
+      return res.status(400).json({ error: 'رقم الحجز غير صالح.' });
     }
 
     const booking = await getBookingForTracking(bookingRef);
