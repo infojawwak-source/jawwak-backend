@@ -1222,13 +1222,13 @@ function extractNotePreference(notes, label) {
 
 app.get('/api/booking-tracking', rateLimit, async (req, res) => {
   try {
-    const bookingRef = String(req.query?.bookingRef || '').trim().toUpperCase();
+    const bookingRef = String(req.query?.bookingRef || '').trim();
 
-    if (!/^JWK-[0-9]{6}-[A-Z0-9]{6}$/.test(bookingRef)) {
-      return res.status(400).json({ error: 'رقم الحجز غير صالح.' });
+    if (!/^JWK-[0-9]{6}-[A-Z0-9]{6}$/.test(bookingRef.toUpperCase())) {
+      return res.status(400).json({ error: 'رقم الطلب غير صالح.' });
     }
 
-    const booking = await getBookingForTracking(bookingRef);
+    const booking = await getBookingForTracking(bookingRef.toUpperCase());
 
     return res.json({
       ok: true,
@@ -1241,6 +1241,7 @@ app.get('/api/booking-tracking', rateLimit, async (req, res) => {
         to_city: booking.to_city,
         to_code: booking.to_code,
         trip_type: booking.trip_type,
+        cabin_class: booking.cabin_class,
         depart_date: booking.depart_date,
         return_date: booking.return_date,
         airline_name: booking.airline_name,
