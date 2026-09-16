@@ -21,9 +21,9 @@ const DUFFEL_TIMEOUT_MS = 20_000;
 const FX_TIMEOUT_MS = 10_000;
 
 // التسعير
-const CURRENCY_FEE_PERCENT = 0;
-const PROFIT_MARGIN_PERCENT = 0;
-const MAX_RESULTS = 70;
+const CURRENCY_FEE_PERCENT = 10;
+const PROFIT_MARGIN_PERCENT = 2;
+const MAX_RESULTS = 40;
 
 // حدود البحث
 const MAX_ADULTS = 9;
