@@ -13,6 +13,8 @@ const DUFFEL_TOKEN = process.env.DUFFEL_ACCESS_TOKEN;
 const DUFFEL_BASE = 'https://api.duffel.com';
 const DUFFEL_API_VERSION = 'v2';
 const FRONTEND_URL = process.env.FRONTEND_URL || '';
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
 // حد زمني لحماية السيرفر من الطلبات المعلقة.
 const DUFFEL_TIMEOUT_MS = 20_000;
@@ -1169,6 +1171,98 @@ app.get(
     });
   }
 );
+
+
+// ══════════════════════════════════════════════
+// تتبع طلب الحجز — بيانات المتابعة العامة فقط
+// ══════════════════════════════════════════════
+
+
+async function getBookingForTracking(bookingRef) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('Supabase service غير مهيأ حالياً.');
+  }
+
+  const url = new URL(`${SUPABASE_URL.replace(/\/$/, '')}/rest/v1/bookings`);
+  url.searchParams.set('select', '*');
+  url.searchParams.set('booking_ref', `eq.${bookingRef}`);
+  url.searchParams.set('limit', '1');
+
+  const response = await fetchWithTimeout(
+    url.toString(),
+    {
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        Accept: 'application/json'
+      }
+    },
+    10_000
+  );
+
+  const data = await response.json().catch(() => []);
+
+  if (!response.ok) {
+    throw new Error(data?.message || data?.error_description || 'تعذر قراءة الحجز من Supabase.');
+  }
+
+  if (!Array.isArray(data) || !data[0]) {
+    throw new Error('لم يتم العثور على الحجز المطلوب.');
+  }
+
+  return data[0];
+}
+
+function extractNotePreference(notes, label) {
+  const text = String(notes || '');
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = text.match(new RegExp(escaped + '\\s*:\\s*([^\n.]+)'));
+  return match?.[1]?.trim() || null;
+}
+
+app.get('/api/booking-tracking', rateLimit, async (req, res) => {
+  try {
+    const bookingRef = String(req.query?.bookingRef || '').trim();
+
+    if (!bookingRef || bookingRef.length > 100) {
+      return res.status(400).json({ error: 'رقم الطلب غير صالح.' });
+    }
+
+    const booking = await getBookingForTracking(bookingRef);
+
+    return res.json({
+      ok: true,
+      booking: {
+        booking_ref: booking.booking_ref,
+        status: booking.status || 'pending',
+        payment_status: booking.payment_status || 'unpaid',
+        from_city: booking.from_city,
+        from_code: booking.from_code,
+        to_city: booking.to_city,
+        to_code: booking.to_code,
+        trip_type: booking.trip_type,
+        depart_date: booking.depart_date,
+        return_date: booking.return_date,
+        airline_name: booking.airline_name,
+        flight_number: booking.flight_number,
+        dep_time: booking.dep_time,
+        arr_time: booking.arr_time,
+        duration: booking.duration,
+        baggage_option: booking.baggage_option || extractNotePreference(booking.notes, 'تفضيل الأمتعة'),
+        seat_preference: extractNotePreference(booking.notes, 'تفضيل المقعد'),
+        created_at: booking.created_at
+      }
+    });
+  } catch (err) {
+    const message = err?.message || '';
+    const notFound = message.includes('لم يتم العثور');
+    console.error('Booking tracking error:', err);
+    return res.status(notFound ? 404 : 500).json({
+      ok: false,
+      error: notFound ? 'لم يتم العثور على طلب بهذا الرقم.' : 'تعذر قراءة حالة الطلب حالياً. حاول مرة أخرى.'
+    });
+  }
+});
 
 app.listen(
   PORT,
