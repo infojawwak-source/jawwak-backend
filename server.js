@@ -1178,6 +1178,18 @@ app.get(
 // ══════════════════════════════════════════════
 
 
+function repairMojibake(value) {
+  if (value === null || value === undefined) return value;
+  const text = String(value);
+  if (!/[ØÙÃÂâð]/.test(text)) return text;
+  try {
+    const repaired = Buffer.from(text, 'latin1').toString('utf8');
+    return repaired.includes('�') ? text : repaired;
+  } catch {
+    return text;
+  }
+}
+
 async function getBookingForTracking(bookingRef) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error('Supabase service غير مهيأ حالياً.');
@@ -1236,21 +1248,21 @@ app.get('/api/booking-tracking', rateLimit, async (req, res) => {
         booking_ref: booking.booking_ref,
         status: booking.status || 'pending',
         payment_status: booking.payment_status || 'unpaid',
-        from_city: booking.from_city,
-        from_code: booking.from_code,
-        to_city: booking.to_city,
-        to_code: booking.to_code,
-        trip_type: booking.trip_type,
-        cabin_class: booking.cabin_class,
-        depart_date: booking.depart_date,
-        return_date: booking.return_date,
-        airline_name: booking.airline_name,
-        flight_number: booking.flight_number,
-        dep_time: booking.dep_time,
-        arr_time: booking.arr_time,
-        duration: booking.duration,
-        baggage_option: booking.baggage_option || extractNotePreference(booking.notes, 'تفضيل الأمتعة'),
-        seat_preference: extractNotePreference(booking.notes, 'تفضيل المقعد'),
+        from_city: repairMojibake(booking.from_city),
+        from_code: repairMojibake(booking.from_code),
+        to_city: repairMojibake(booking.to_city),
+        to_code: repairMojibake(booking.to_code),
+        trip_type: repairMojibake(booking.trip_type),
+        cabin_class: repairMojibake(booking.cabin_class),
+        depart_date: repairMojibake(booking.depart_date),
+        return_date: repairMojibake(booking.return_date),
+        airline_name: repairMojibake(booking.airline_name),
+        flight_number: repairMojibake(booking.flight_number),
+        dep_time: repairMojibake(booking.dep_time),
+        arr_time: repairMojibake(booking.arr_time),
+        duration: repairMojibake(booking.duration),
+        baggage_option: repairMojibake(booking.baggage_option || extractNotePreference(booking.notes, 'تفضيل الأمتعة')),
+        seat_preference: repairMojibake(extractNotePreference(booking.notes, 'تفضيل المقعد')),
         created_at: booking.created_at
       }
     });
