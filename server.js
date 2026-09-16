@@ -23,7 +23,7 @@ const FX_TIMEOUT_MS = 10_000;
 // التسعير
 const CURRENCY_FEE_PERCENT = 0;
 const PROFIT_MARGIN_PERCENT = 0;
-const MAX_RESULTS = 70;
+const MAX_RESULTS = 35;
 
 // حدود البحث
 const MAX_ADULTS = 9;
