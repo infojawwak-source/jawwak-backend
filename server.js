@@ -30,7 +30,7 @@ const CURRENCY_FEE_PERCENT = 0;
 // هامش الربح حسب مصدر الرحلات.
 // Duffel يظل بدون هامش، وIgnav فقط عليه 15%.
 const DUFFEL_PROFIT_MARGIN_PERCENT = 0;
-const IGNAV_PROFIT_MARGIN_PERCENT = 20;
+const IGNAV_PROFIT_MARGIN_PERCENT = 40;
 
 const MAX_RESULTS = 35;
 
