@@ -1,6 +1,6 @@
 // ══════════════════════════════════════════════
 // سيرفر جوّك الخلفي — Launch Ready
-// Duffel + تحويل عملة إلى EGP + تحقق من السعر قبل تأكيد الطلب
+// Duffel + Ignav + تحويل عملة إلى EGP + تحقق من السعر قبل تأكيد الطلب
 // ══════════════════════════════════════════════
 import express from 'express';
 import cors from 'cors';
@@ -12,18 +12,27 @@ const PORT = Number(process.env.PORT) || 3000;
 const DUFFEL_TOKEN = process.env.DUFFEL_ACCESS_TOKEN;
 const DUFFEL_BASE = 'https://api.duffel.com';
 const DUFFEL_API_VERSION = 'v2';
+
+const IGNAV_API_KEY = process.env.IGNAV_API_KEY || '';
+const IGNAV_BASE = 'https://ignav.com/api';
 const FRONTEND_URL = process.env.FRONTEND_URL || '';
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
 // حد زمني لحماية السيرفر من الطلبات المعلقة.
 const DUFFEL_TIMEOUT_MS = 20_000;
+const IGNAV_TIMEOUT_MS = 20_000;
 const FX_TIMEOUT_MS = 10_000;
 
 // التسعير
-const CURRENCY_FEE_PERCENT = 10;
-const PROFIT_MARGIN_PERCENT = 0;
-const MAX_RESULTS = 40;
+const CURRENCY_FEE_PERCENT = 0;
+
+// هامش الربح حسب مصدر الرحلات.
+// Duffel يظل بدون هامش، وIgnav فقط عليه 15%.
+const DUFFEL_PROFIT_MARGIN_PERCENT = 0;
+const IGNAV_PROFIT_MARGIN_PERCENT = 15;
+
+const MAX_RESULTS = 35;
 
 // حدود البحث
 const MAX_ADULTS = 9;
@@ -239,7 +248,10 @@ async function convertToEGP(amount, fromCurrency) {
   return amountInEGP;
 }
 
-function applyPricing(egpAmount) {
+function applyPricing(
+  egpAmount,
+  profitMarginPercent = 0
+) {
   const numericAmount = Number(egpAmount);
 
   if (
@@ -257,7 +269,7 @@ function applyPricing(egpAmount) {
 
   const afterMargin =
     afterCurrencyFee *
-    (1 + PROFIT_MARGIN_PERCENT / 100);
+    (1 + profitMarginPercent / 100);
 
   if (
     !Number.isFinite(afterMargin) ||
@@ -545,7 +557,10 @@ async function formatDuffelOffer(offer) {
 
   const finalPrice =
     Math.round(
-      applyPricing(rawEGP)
+      applyPricing(
+        rawEGP,
+        DUFFEL_PROFIT_MARGIN_PERCENT
+      )
     );
 
   if (
@@ -716,59 +731,27 @@ async function formatDuffelOffer(offer) {
   };
 }
 
-async function formatDuffelResults(
-  offers
-) {
-  const results =
-    await Promise.all(
-      offers.map(
-        async offer => {
-          try {
-            return await formatDuffelOffer(
-              offer
-            );
-          } catch (e) {
-            console.error(
-              `تم استبعاد عرض بسبب مشكلة في السعر: ${offer?.id || 'unknown'} — ${e.message}`
-            );
-
-            return null;
-          }
-        }
-      )
+function selectDiverseResults(results) {
+  const sortedResults = results
+    .filter(Boolean)
+    .sort(
+      (a, b) =>
+        Number(a.price) - Number(b.price)
     );
 
-  const sortedResults =
-    results
-      .filter(Boolean)
-      .sort(
-        (a, b) =>
-          a.price - b.price
-      );
-
   const selectedResults = [];
-
-  const remainingResults =
-    [...sortedResults];
-
-  const airlineCounts =
-    new Map();
+  const remainingResults = [...sortedResults];
+  const airlineCounts = new Map();
 
   while (
-    selectedResults.length <
-      MAX_RESULTS &&
+    selectedResults.length < MAX_RESULTS &&
     remainingResults.length
   ) {
     let bestIndex = 0;
     let bestScore = Infinity;
 
-    for (
-      let i = 0;
-      i < remainingResults.length;
-      i++
-    ) {
-      const flight =
-        remainingResults[i];
+    for (let i = 0; i < remainingResults.length; i++) {
+      const flight = remainingResults[i];
 
       const airlineKey =
         flight.airlineCode ||
@@ -776,15 +759,14 @@ async function formatDuffelResults(
         'unknown';
 
       const airlineCount =
-        airlineCounts.get(
-          airlineKey
-        ) || 0;
+        airlineCounts.get(airlineKey) || 0;
 
       const diversityPenalty =
         airlineCount * 0.025;
 
+      // لا نسمح للتنوع أن يتغلب بشكل مبالغ فيه على فرق السعر.
       const score =
-        flight.price *
+        Number(flight.price) *
         (1 + diversityPenalty);
 
       if (score < bestScore) {
@@ -794,10 +776,7 @@ async function formatDuffelResults(
     }
 
     const selectedFlight =
-      remainingResults.splice(
-        bestIndex,
-        1
-      )[0];
+      remainingResults.splice(bestIndex, 1)[0];
 
     const airlineKey =
       selectedFlight.airlineCode ||
@@ -806,21 +785,543 @@ async function formatDuffelResults(
 
     airlineCounts.set(
       airlineKey,
-      (
-        airlineCounts.get(
-          airlineKey
-        ) || 0
-      ) + 1
+      (airlineCounts.get(airlineKey) || 0) + 1
     );
 
-    selectedResults.push(
-      selectedFlight
-    );
+    selectedResults.push(selectedFlight);
   }
 
   return selectedResults.sort(
-    (a, b) =>
-      a.price - b.price
+    (a, b) => Number(a.price) - Number(b.price)
+  );
+}
+
+function formatMinutesDuration(minutes) {
+  const total = Number(minutes);
+
+  if (!Number.isFinite(total) || total < 0) {
+    return '';
+  }
+
+  const rounded = Math.round(total);
+  const hours = Math.floor(rounded / 60);
+  const mins = rounded % 60;
+
+  if (hours > 0 && mins > 0) {
+    return `${hours}h ${mins}m`;
+  }
+
+  if (hours > 0) {
+    return `${hours}h`;
+  }
+
+  return `${mins}m`;
+}
+
+function formatIgnavBaggage(itinerary) {
+  const bags = itinerary?.bags || itinerary?.baggage || null;
+
+  if (!bags || typeof bags !== 'object') {
+    return null;
+  }
+
+  const hasChecked =
+    bags.checked !== undefined ||
+    bags.checked_bags !== undefined ||
+    bags.checkedBags !== undefined;
+
+  const hasCarryOn =
+    bags.carry_on !== undefined ||
+    bags.carryOn !== undefined ||
+    bags.carry_on_bags !== undefined ||
+    bags.carryOnBags !== undefined;
+
+  if (!hasChecked && !hasCarryOn) {
+    return null;
+  }
+
+  const checkedRaw =
+    bags.checked ??
+    bags.checked_bags ??
+    bags.checkedBags ??
+    0;
+
+  const carryOnRaw =
+    bags.carry_on ??
+    bags.carryOn ??
+    bags.carry_on_bags ??
+    bags.carryOnBags ??
+    0;
+
+  const readQuantity = value => {
+    if (value && typeof value === 'object') {
+      return Number(
+        value.quantity ??
+        value.count ??
+        value.number ??
+        0
+      );
+    }
+
+    return Number(value || 0);
+  };
+
+  const checkedQuantity = Math.max(
+    0,
+    readQuantity(checkedRaw)
+  );
+
+  const carryOnQuantity = Math.max(
+    0,
+    readQuantity(carryOnRaw)
+  );
+
+  return {
+    checkedIncluded: checkedQuantity > 0,
+    checkedQuantity,
+    carryOnIncluded: carryOnQuantity > 0,
+    carryOnQuantity
+  };
+}
+
+function formatIgnavLeg(leg) {
+  if (!leg?.segments?.length) {
+    throw new Error('بيانات رحلة Ignav غير مكتملة');
+  }
+
+  const firstSegment = leg.segments[0];
+  const lastSegment =
+    leg.segments[leg.segments.length - 1];
+
+  const airlineCode =
+    firstSegment.marketing_carrier_code ||
+    '';
+
+  const airlineName =
+    firstSegment.operating_carrier_name ||
+    leg.carrier ||
+    'شركة طيران';
+
+  const flightNumber =
+    airlineCode +
+    String(firstSegment.flight_number || '');
+
+  const depDateTime =
+    String(
+      firstSegment.departure_time_local || ''
+    );
+
+  const arrDateTime =
+    String(
+      lastSegment.arrival_time_local || ''
+    );
+
+  return {
+    airlineCode,
+    airlineName,
+    flightNumber,
+    from:
+      firstSegment.departure_airport || '',
+    to:
+      lastSegment.arrival_airport || '',
+    depTime: depDateTime.slice(11, 16),
+    arrTime: arrDateTime.slice(11, 16),
+    duration:
+      formatMinutesDuration(
+        leg.duration_minutes
+      ),
+    stops:
+      Math.max(
+        0,
+        leg.segments.length - 1
+      )
+  };
+}
+
+async function formatIgnavItinerary(itinerary) {
+  if (!itinerary?.outbound?.segments?.length) {
+    throw new Error('رحلة Ignav بدون بيانات كافية');
+  }
+
+  const priceAmount =
+    Number(itinerary.price?.amount);
+
+  const originalCurrency =
+    itinerary.price?.currency || 'EGP';
+
+  if (
+    !Number.isFinite(priceAmount) ||
+    priceAmount < 0
+  ) {
+    throw new Error(
+      `بيانات السعر الأصلية غير صالحة لرحلة Ignav ${itinerary.ignav_id || 'unknown'}`
+    );
+  }
+
+  const rawEGP =
+    await convertToEGP(
+      priceAmount,
+      originalCurrency
+    );
+
+  const finalPrice =
+    Math.round(
+      applyPricing(
+        rawEGP,
+        IGNAV_PROFIT_MARGIN_PERCENT
+      )
+    );
+
+  if (
+    !Number.isFinite(finalPrice) ||
+    finalPrice < 0
+  ) {
+    throw new Error(
+      'السعر النهائي لرحلة Ignav غير صالح'
+    );
+  }
+
+  const outbound =
+    formatIgnavLeg(
+      itinerary.outbound
+    );
+
+  let returnLeg = null;
+
+  if (itinerary.inbound?.segments?.length) {
+    returnLeg =
+      formatIgnavLeg(
+        itinerary.inbound
+      );
+  }
+
+  const baggage =
+    formatIgnavBaggage(itinerary);
+
+  return {
+    id:
+      `ignav:${String(
+        itinerary.ignav_id || ''
+      )}`,
+    airlineCode:
+      outbound.airlineCode,
+    airlineName:
+      outbound.airlineName,
+    flightNumber:
+      outbound.flightNumber,
+    from:
+      outbound.from,
+    to:
+      outbound.to,
+    depTime:
+      outbound.depTime,
+    arrTime:
+      outbound.arrTime,
+    duration:
+      outbound.duration,
+    stops:
+      outbound.stops,
+    returnLeg,
+    price: finalPrice,
+    currency: 'EGP',
+    originalPrice:
+      Math.round(priceAmount),
+    originalCurrency,
+    seatsLeft: null,
+    cabin:
+      itinerary.cabin_class || 'economy',
+    baggage,
+    // Ignav لا يعرض في استجابة البحث حكماً موثوقاً
+    // عن قابلية الاسترداد بنفس صيغة Duffel.
+    refundable: null,
+    refundPenalty: null,
+    refundPenaltyCurrency: null,
+    source: 'ignav',
+    ignavId:
+      itinerary.ignav_id || null,
+    priceStatus:
+      itinerary.price?.status || 'unverified',
+    selfTransfer:
+      Boolean(
+        itinerary.requires_self_transfer
+      )
+  };
+}
+
+async function formatIgnavResults(itineraries) {
+  const results = await Promise.all(
+    (Array.isArray(itineraries)
+      ? itineraries
+      : []
+    ).map(async itinerary => {
+      try {
+        return await formatIgnavItinerary(
+          itinerary
+        );
+      } catch (e) {
+        console.error(
+          `تم استبعاد رحلة Ignav بسبب مشكلة في البيانات: ${itinerary?.ignav_id || 'unknown'} — ${e.message}`
+        );
+
+        return null;
+      }
+    })
+  );
+
+  return results.filter(Boolean);
+}
+
+function flightIdentity(flight) {
+  const returnLeg = flight.returnLeg || null;
+
+  return [
+    flight.airlineCode || '',
+    flight.flightNumber || '',
+    flight.from || '',
+    flight.to || '',
+    flight.depTime || '',
+    flight.arrTime || '',
+    returnLeg?.flightNumber || '',
+    returnLeg?.from || '',
+    returnLeg?.to || '',
+    returnLeg?.depTime || '',
+    returnLeg?.arrTime || ''
+  ].join('|');
+}
+
+function mergeFlightResults(duffelResults, ignavResults) {
+  const merged = new Map();
+
+  for (const flight of [
+    ...(duffelResults || []),
+    ...(ignavResults || [])
+  ]) {
+    if (!flight) continue;
+
+    const key = flightIdentity(flight);
+    const existing = merged.get(key);
+
+    if (!existing) {
+      merged.set(key, flight);
+      continue;
+    }
+
+    const existingVerified =
+      existing.priceStatus === 'verified';
+    const currentVerified =
+      flight.priceStatus === 'verified';
+
+    if (
+      currentVerified &&
+      !existingVerified
+    ) {
+      merged.set(key, flight);
+      continue;
+    }
+
+    if (
+      currentVerified === existingVerified &&
+      Number(flight.price) <
+        Number(existing.price)
+    ) {
+      merged.set(key, {
+        ...flight,
+        source:
+          existing.source &&
+          existing.source !== flight.source
+            ? `${existing.source}+${flight.source}`
+            : flight.source
+      });
+    }
+  }
+
+  return [...merged.values()];
+}
+
+function ignavHeaders() {
+  return {
+    'X-Api-Key': IGNAV_API_KEY,
+    'Content-Type': 'application/json',
+    Accept: 'application/json'
+  };
+}
+
+async function searchDuffelFlights({
+  from,
+  to,
+  departDate,
+  returnDate,
+  adults,
+  children,
+  infants,
+  cabin
+}) {
+  if (!DUFFEL_TOKEN) {
+    throw new Error(
+      'Duffel غير مهيأ حالياً'
+    );
+  }
+
+  const passengers = [];
+
+  for (let i = 0; i < adults; i++) {
+    passengers.push({
+      type: 'adult'
+    });
+  }
+
+  for (let i = 0; i < children; i++) {
+    passengers.push({
+      type: 'child'
+    });
+  }
+
+  for (let i = 0; i < infants; i++) {
+    passengers.push({
+      type: 'infant_without_seat'
+    });
+  }
+
+  const slices = [
+    {
+      origin: from,
+      destination: to,
+      departure_date: departDate
+    }
+  ];
+
+  if (returnDate) {
+    slices.push({
+      origin: to,
+      destination: from,
+      departure_date: returnDate
+    });
+  }
+
+  const offerReqRes =
+    await fetchWithTimeout(
+      `${DUFFEL_BASE}/air/offer_requests?return_offers=true&supplier_timeout=10000`,
+      {
+        method: 'POST',
+        headers: duffelHeaders(),
+        body: JSON.stringify({
+          data: {
+            slices,
+            passengers,
+            cabin_class: cabin
+          }
+        })
+      }
+    );
+
+  if (!offerReqRes.ok) {
+    console.error(
+      'Duffel search error:',
+      offerReqRes.status
+    );
+
+    throw new Error(
+      duffelErrorMessage(
+        offerReqRes.status
+      )
+    );
+  }
+
+  const offerReqData =
+    await offerReqRes.json();
+
+  const offers =
+    offerReqData.data?.offers || [];
+
+  const formatted =
+    await Promise.all(
+      offers.map(async offer => {
+        try {
+          return await formatDuffelOffer(
+            offer
+          );
+        } catch (e) {
+          console.error(
+            `تم استبعاد عرض Duffel بسبب مشكلة في السعر: ${offer?.id || 'unknown'} — ${e.message}`
+          );
+
+          return null;
+        }
+      })
+    );
+
+  return formatted.filter(Boolean);
+}
+
+async function searchIgnavFlights({
+  from,
+  to,
+  departDate,
+  returnDate,
+  adults,
+  children,
+  infants,
+  cabin
+}) {
+  if (!IGNAV_API_KEY) {
+    throw new Error(
+      'Ignav غير مهيأ حالياً'
+    );
+  }
+
+  const endpoint =
+    returnDate
+      ? `${IGNAV_BASE}/fares/round-trip`
+      : `${IGNAV_BASE}/fares/one-way`;
+
+  const body = {
+    origin: from,
+    destination: to,
+    departure_date: departDate,
+    adults,
+    children,
+    infants_on_lap: infants,
+    cabin_class: cabin,
+    market: 'EG'
+  };
+
+  if (returnDate) {
+    body.return_date = returnDate;
+  }
+
+  const response =
+    await fetchWithTimeout(
+      endpoint,
+      {
+        method: 'POST',
+        headers: ignavHeaders(),
+        body: JSON.stringify(body)
+      },
+      IGNAV_TIMEOUT_MS
+    );
+
+  if (!response.ok) {
+    const errorData =
+      await response.json().catch(() => null);
+
+    const providerMessage =
+      errorData?.message ||
+      errorData?.error ||
+      errorData?.detail ||
+      '';
+
+    throw new Error(
+      providerMessage
+        ? `Ignav: ${providerMessage}`
+        : `Ignav search error (${response.status})`
+    );
+  }
+
+  const data =
+    await response.json();
+
+  return await formatIgnavResults(
+    data?.itineraries || []
   );
 }
 
@@ -858,7 +1359,7 @@ app.post(
   rateLimit,
   async (req, res) => {
     try {
-      if (!DUFFEL_TOKEN) {
+      if (!DUFFEL_TOKEN && !IGNAV_API_KEY) {
         return res.status(503).json({
           error:
             'خدمة البحث غير مهيأة حالياً.'
@@ -888,101 +1389,105 @@ app.post(
         cabin
       } = validation.value;
 
-      const passengers = [];
+      const searches = [];
 
-      for (
-        let i = 0;
-        i < adults;
-        i++
-      ) {
-        passengers.push({
-          type: 'adult'
+      if (DUFFEL_TOKEN) {
+        searches.push({
+          source: 'duffel',
+          promise:
+            searchDuffelFlights({
+              from,
+              to,
+              departDate,
+              returnDate,
+              adults,
+              children,
+              infants,
+              cabin
+            })
         });
       }
 
-      for (
-        let i = 0;
-        i < children;
-        i++
-      ) {
-        passengers.push({
-          type: 'child'
+      if (IGNAV_API_KEY) {
+        searches.push({
+          source: 'ignav',
+          promise:
+            searchIgnavFlights({
+              from,
+              to,
+              departDate,
+              returnDate,
+              adults,
+              children,
+              infants,
+              cabin
+            })
         });
       }
 
-      for (
-        let i = 0;
-        i < infants;
-        i++
-      ) {
-        passengers.push({
-          type:
-            'infant_without_seat'
-        });
-      }
+      const settled =
+        await Promise.allSettled(
+          searches.map(
+            item => item.promise
+          )
+        );
 
-      const slices = [
-        {
-          origin: from,
-          destination: to,
-          departure_date:
-            departDate
-        }
-      ];
+      const duffelResults = [];
+      const ignavResults = [];
+      const providerErrors = [];
 
-      if (returnDate) {
-        slices.push({
-          origin: to,
-          destination: from,
-          departure_date:
-            returnDate
-        });
-      }
+      settled.forEach(
+        (result, index) => {
+          const source =
+            searches[index].source;
 
-      const offerReqRes =
-        await fetchWithTimeout(
-          `${DUFFEL_BASE}/air/offer_requests?return_offers=true&supplier_timeout=10000`,
-          {
-            method: 'POST',
+          if (
+            result.status === 'fulfilled'
+          ) {
+            if (source === 'duffel') {
+              duffelResults.push(
+                ...(result.value || [])
+              );
+            } else {
+              ignavResults.push(
+                ...(result.value || [])
+              );
+            }
+          } else {
+            providerErrors.push({
+              source,
+              error:
+                result.reason?.message ||
+                'فشل مصدر الرحلات'
+            });
 
-            headers:
-              duffelHeaders(),
-
-            body: JSON.stringify({
-              data: {
-                slices,
-                passengers,
-                cabin_class:
-                  cabin,
-              },
-            }),
+            console.error(
+              `${source} search failed:`,
+              result.reason
+            );
           }
-        );
+        }
+      );
 
-      if (!offerReqRes.ok) {
-        console.error(
-          'Duffel search error:',
-          offerReqRes.status
-        );
-
+      if (
+        duffelResults.length === 0 &&
+        ignavResults.length === 0
+      ) {
         return res.status(502).json({
           error:
-            duffelErrorMessage(
-              offerReqRes.status
-            )
+            'تعذر جلب الرحلات حالياً من مصادر البحث. حاول مرة أخرى بعد قليل.'
         });
       }
 
-      const offerReqData =
-        await offerReqRes.json();
-
-      const offers =
-        offerReqData.data?.offers ||
-        [];
+      const mergedResults =
+        mergeFlightResults(
+          duffelResults,
+          ignavResults
+        );
 
       const formatted =
-        await formatDuffelResults(
-          offers
+        selectDiverseResults(
+          mergedResults
         );
 
       return res.json({
@@ -990,7 +1495,6 @@ app.post(
         count: formatted.length,
         currency: 'EGP'
       });
-
     } catch (err) {
       console.error(err);
 
@@ -1150,6 +1654,9 @@ app.get(
       duffelConfigured:
         Boolean(DUFFEL_TOKEN),
 
+      ignavConfigured:
+        Boolean(IGNAV_API_KEY),
+
       mode:
         DUFFEL_TOKEN?.startsWith(
           'duffel_test_'
@@ -1160,6 +1667,12 @@ app.get(
                 ? 'live'
                 : 'not-configured'
             ),
+
+      searchSources:
+        [
+          DUFFEL_TOKEN ? 'duffel' : null,
+          IGNAV_API_KEY ? 'ignav' : null
+        ].filter(Boolean),
 
       currencyConversion:
         ratesOk
@@ -1285,7 +1798,7 @@ app.listen(
     );
 
     console.log(
-      '   مصدر البيانات: Duffel API'
+      '   مصادر البحث: Duffel + Ignav (حسب المتاح)'
     );
 
     console.log(
