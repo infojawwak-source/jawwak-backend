@@ -32,7 +32,7 @@ const CURRENCY_FEE_PERCENT = 0;
 const DUFFEL_PROFIT_MARGIN_PERCENT = 0;
 const IGNAV_PROFIT_MARGIN_PERCENT = 15;
 
-const MAX_RESULTS = 40;
+const MAX_RESULTS = 20;
 
 // حدود البحث
 const MAX_ADULTS = 9;
