@@ -20,8 +20,21 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const SERPAPI_SERVICE_URL = (process.env.SERPAPI_SERVICE_URL || 'https://jawwak-serpapi.onrender.com').replace(/\/$/, '');
 const SERPAPI_SERVICE_SECRET = process.env.SERPAPI_SERVICE_SECRET || '';
 
+// iGnav — مصدر بحث إضافي. المفتاح يظل على السيرفر فقط.
+const IGNAV_BASE = (process.env.IGNAV_BASE || 'https://ignav.com/api').replace(/\/$/, '');
+const IGNAV_API_KEY = process.env.IGNAV_API_KEY || '';
+const IGNAV_TIMEOUT_MS = 30_000;
+
+// وقت البحث الكلي. Duffel + iGnav يأخذان وقت المرحلة الأولى كاملاً،
+// ثم يبدأ SerpApi فقط إذا انتهت المرحلة الأولى بدون نتائج.
+// يتم إيقاظ SerpApi في الخلفية عند بداية الطلب، بدون بدء بحث فعلي،
+// حتى لا نستهلك وقتاً إضافياً في الـ cold start عند الحاجة إليه.
+const SEARCH_TOTAL_TIMEOUT_MS = 60_000;
+const PRIMARY_SEARCH_TIMEOUT_MS = 30_000;
+const SERP_FALLBACK_TIMEOUT_MS = 29_000;
+
 // حد زمني لحماية السيرفر من الطلبات المعلقة.
-const DUFFEL_TIMEOUT_MS = 20_000;
+const DUFFEL_TIMEOUT_MS = PRIMARY_SEARCH_TIMEOUT_MS;
 const FX_TIMEOUT_MS = 10_000;
 
 // التسعير
@@ -750,14 +763,242 @@ async function formatDuffelResults(
 
 
 // ══════════════════════════════════════════════
+// iGnav — البحث فقط، بدون أي منطق حجز
+// ══════════════════════════════════════════════
+
+async function searchIgnavFlights(searchPayload) {
+  if (!IGNAV_API_KEY) return [];
+
+  const isRoundTrip = Boolean(searchPayload.returnDate);
+  const endpoint = isRoundTrip
+    ? `${IGNAV_BASE}/fares/round-trip`
+    : `${IGNAV_BASE}/fares/one-way`;
+
+  const body = {
+    origin: searchPayload.from,
+    destination: searchPayload.to,
+    departure_date: searchPayload.departDate,
+    adults: searchPayload.adults,
+    children: searchPayload.children,
+    infants_on_lap: searchPayload.infants,
+    cabin_class: searchPayload.cabin,
+    market: 'EG',
+  };
+
+  if (isRoundTrip) {
+    body.return_date = searchPayload.returnDate;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), IGNAV_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'X-Api-Key': IGNAV_API_KEY,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(
+        data?.message ||
+        data?.error ||
+        `iGnav returned ${response.status}`
+      );
+    }
+
+    const itineraries = Array.isArray(data?.itineraries)
+      ? data.itineraries
+      : [];
+
+    return itineraries;
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error('انتهت مهلة الاتصال بخدمة iGnav.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function ignavTime(value) {
+  const text = String(value || '');
+  const match = text.match(/T(\d{2}:\d{2})/);
+  if (match) return match[1];
+  const plain = text.match(/(\d{2}:\d{2})/);
+  return plain ? plain[1] : '';
+}
+
+function ignavDuration(minutes) {
+  const n = Number(minutes);
+  if (!Number.isFinite(n) || n < 0) return '';
+  const h = Math.floor(n / 60);
+  const m = n % 60;
+  return `${h}h${m ? `${m}m` : ''}`;
+}
+
+function normalizeIgnavLeg(leg) {
+  if (!leg || !Array.isArray(leg.segments) || !leg.segments.length) {
+    return null;
+  }
+
+  const first = leg.segments[0];
+  const last = leg.segments[leg.segments.length - 1];
+
+  const carrierCode = String(
+    first?.marketing_carrier_code || ''
+  ).toUpperCase();
+
+  const flightNumber = String(first?.flight_number || '');
+
+  return {
+    from: first?.departure_airport || '',
+    to: last?.arrival_airport || '',
+    depTime: ignavTime(first?.departure_time_local),
+    arrTime: ignavTime(last?.arrival_time_local),
+    duration: ignavDuration(leg?.duration_minutes),
+    stops: Math.max(0, leg.segments.length - 1),
+    flightNumber: `${carrierCode}${flightNumber}`,
+    airlineCode: carrierCode,
+    airlineName:
+      leg?.carrier ||
+      first?.operating_carrier_name ||
+      'شركة طيران',
+  };
+}
+
+async function formatIgnavResults(itineraries) {
+  return Promise.all(
+    (itineraries || []).map(async (itinerary, index) => {
+      try {
+        const rawPrice = Number(itinerary?.price?.amount);
+        const originalCurrency = String(
+          itinerary?.price?.currency || 'USD'
+        ).toUpperCase();
+
+        if (!Number.isFinite(rawPrice) || rawPrice < 0) {
+          return null;
+        }
+
+        const outbound = normalizeIgnavLeg(itinerary?.outbound);
+        if (!outbound) return null;
+
+        const inbound = itinerary?.inbound
+          ? normalizeIgnavLeg(itinerary.inbound)
+          : null;
+
+        const rawEGP = await convertToEGP(
+          rawPrice,
+          originalCurrency
+        );
+
+        const finalPrice = Math.round(applyPricing(rawEGP));
+        if (!Number.isFinite(finalPrice) || finalPrice < 0) {
+          return null;
+        }
+
+        const bags = itinerary?.bags || {};
+        const checked = Number(bags.checked || 0);
+        const carryOn = Number(bags.carry_on || 0);
+
+        return {
+          id: String(
+            itinerary?.ignav_id ||
+            `ignav_${index}_${Date.now()}`
+          ),
+          source: 'ignav',
+          airlineCode: outbound.airlineCode,
+          airlineName: outbound.airlineName,
+          flightNumber: outbound.flightNumber,
+          from: outbound.from,
+          to: outbound.to,
+          depTime: outbound.depTime,
+          arrTime: outbound.arrTime,
+          duration: outbound.duration,
+          stops: outbound.stops,
+          returnLeg: inbound
+            ? {
+                from: inbound.from,
+                to: inbound.to,
+                depTime: inbound.depTime,
+                arrTime: inbound.arrTime,
+                duration: inbound.duration,
+                stops: inbound.stops,
+                flightNumber: inbound.flightNumber,
+              }
+            : null,
+          price: finalPrice,
+          currency: 'EGP',
+          originalPrice: rawPrice,
+          originalCurrency,
+          seatsLeft: null,
+          cabin: itinerary?.cabin_class || 'economy',
+          baggage: {
+            checkedIncluded: checked > 0,
+            checkedQuantity: checked,
+            carryOnIncluded: carryOn > 0,
+            carryOnQuantity: carryOn,
+          },
+          refundable: null,
+          refundPenalty: null,
+          refundPenaltyCurrency: null,
+          ignavId: itinerary?.ignav_id || null,
+          requiresSelfTransfer:
+            Boolean(itinerary?.requires_self_transfer),
+        };
+      } catch (err) {
+        console.error('تم استبعاد نتيجة iGnav:', err?.message || err);
+        return null;
+      }
+    })
+  ).then(items => items.filter(Boolean));
+}
+
+// ══════════════════════════════════════════════
 // SerpApi — البحث فقط، بدون أي منطق حجز
 // ══════════════════════════════════════════════
 
-async function searchSerpApiService(searchPayload) {
+async function wakeSerpApiService() {
+  if (!SERPAPI_SERVICE_URL) return;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5_000);
+
+  try {
+    // هذا الطلب للإيقاظ فقط. لا ننتظر اكتماله ولا نستخدم نتيجته في البحث.
+    await fetch(`${SERPAPI_SERVICE_URL}/api/health`, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        ...(SERPAPI_SERVICE_SECRET
+          ? { 'x-serpapi-service-secret': SERPAPI_SERVICE_SECRET }
+          : {}),
+      },
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+  } catch (err) {
+    // الهدف من الطلب هو بدء تشغيل الخدمة فقط؛ فشل/انتهاء مهلة طلب الإيقاظ
+    // لا يمنع البحث الفعلي لاحقاً.
+    console.warn('SerpApi wake-up request:', err?.message || err);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function searchSerpApiService(searchPayload, timeoutMs = SERP_FALLBACK_TIMEOUT_MS) {
   if (!SERPAPI_SERVICE_URL) return [];
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), DUFFEL_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(
@@ -1000,23 +1241,20 @@ app.post(
   '/api/search-flights',
   rateLimit,
   async (req, res) => {
+    const requestStartedAt = Date.now();
+
     try {
-      if (!DUFFEL_TOKEN && !SERPAPI_SERVICE_URL) {
+      if (!DUFFEL_TOKEN && !IGNAV_API_KEY && !SERPAPI_SERVICE_URL) {
         return res.status(503).json({
-          error:
-            'خدمة البحث غير مهيأة حالياً.'
+          error: 'خدمة البحث غير مهيأة حالياً.'
         });
       }
 
-      const validation =
-        validateSearchBody(
-          req.body
-        );
+      const validation = validateSearchBody(req.body);
 
       if (validation.error) {
         return res.status(400).json({
-          error:
-            validation.error
+          error: validation.error
         });
       }
 
@@ -1033,43 +1271,23 @@ app.post(
 
       const passengers = [];
 
-      for (
-        let i = 0;
-        i < adults;
-        i++
-      ) {
-        passengers.push({
-          type: 'adult'
-        });
+      for (let i = 0; i < adults; i++) {
+        passengers.push({ type: 'adult' });
       }
 
-      for (
-        let i = 0;
-        i < children;
-        i++
-      ) {
-        passengers.push({
-          type: 'child'
-        });
+      for (let i = 0; i < children; i++) {
+        passengers.push({ type: 'child' });
       }
 
-      for (
-        let i = 0;
-        i < infants;
-        i++
-      ) {
-        passengers.push({
-          type:
-            'infant_without_seat'
-        });
+      for (let i = 0; i < infants; i++) {
+        passengers.push({ type: 'infant_without_seat' });
       }
 
       const slices = [
         {
           origin: from,
           destination: to,
-          departure_date:
-            departDate
+          departure_date: departDate
         }
       ];
 
@@ -1077,8 +1295,7 @@ app.post(
         slices.push({
           origin: to,
           destination: from,
-          departure_date:
-            returnDate
+          departure_date: returnDate
         });
       }
 
@@ -1093,99 +1310,150 @@ app.post(
         cabin,
       };
 
+      // نبدأ تحديث سعر الصرف بالتوازي مع مصادر البحث حتى لا نضيف
+      // وقتاً منفصلاً لتحويل أسعار iGnav إلى EGP عند أول طلب.
+      const ratesWarmup = getExchangeRates().catch(err => {
+        console.warn('Exchange-rate warmup failed:', err?.message || err);
+        return null;
+      });
+
+      // ══════════════════════════════════════════════
+      // تهيئة SerpApi في الخلفية فقط (بدون بدء بحث).
+      // إذا كانت الخدمة نائمة على Render، هذا الطلب يبدأ إيقاظها مبكراً
+      // بينما Duffel + iGnav ينفذان البحث الحقيقي.
+      // لا ننتظر wake-up ولا نستخدم نتيجته في قرار البحث.
+      // ══════════════════════════════════════════════
+      if (SERPAPI_SERVICE_URL) {
+        void wakeSerpApiService();
+      }
+
+      // ══════════════════════════════════════════════
+      // المرحلة الأولى: Duffel + iGnav معاً.
+      // كلا المصدرين يعملان بالتوازي، وفشل أحدهما لا يوقف الآخر.
+      // ══════════════════════════════════════════════
+
       const duffelPromise = DUFFEL_TOKEN
         ? (async () => {
-            const offerReqRes =
-              await fetchWithTimeout(
-                `${DUFFEL_BASE}/air/offer_requests?return_offers=true&supplier_timeout=10000`,
-                {
-                  method: 'POST',
-                  headers: duffelHeaders(),
-                  body: JSON.stringify({
-                    data: {
-                      slices,
-                      passengers,
-                      cabin_class:
-                        cabin,
-                    },
-                  }),
-                }
-              );
+            const offerReqRes = await fetchWithTimeout(
+              `${DUFFEL_BASE}/air/offer_requests?return_offers=true&supplier_timeout=10000`,
+              {
+                method: 'POST',
+                headers: duffelHeaders(),
+                body: JSON.stringify({
+                  data: {
+                    slices,
+                    passengers,
+                    cabin_class: cabin,
+                  },
+                }),
+              },
+              PRIMARY_SEARCH_TIMEOUT_MS
+            );
 
             if (!offerReqRes.ok) {
               throw new Error(
-                duffelErrorMessage(
-                  offerReqRes.status
-                )
+                duffelErrorMessage(offerReqRes.status)
               );
             }
 
-            const offerReqData =
-              await offerReqRes.json();
-
-            const offers =
-              offerReqData.data?.offers ||
-              [];
-
+            const offerReqData = await offerReqRes.json();
+            const offers = offerReqData.data?.offers || [];
             return formatDuffelResults(offers);
           })()
         : Promise.resolve([]);
 
-      // Duffel وSerpApi يعملان بالتوازي، وفشل أحدهما لا يمنع المصدر الآخر.
-      const serpPromise = SERPAPI_SERVICE_URL
-        ? searchSerpApiService(searchPayload)
-            .then(formatSerpApiResults)
+      const ignavPromise = IGNAV_API_KEY
+        ? searchIgnavFlights(searchPayload)
+            .then(formatIgnavResults)
         : Promise.resolve([]);
 
-      const [duffelResult, serpResult] =
-        await Promise.allSettled([
-          duffelPromise,
-          serpPromise
-        ]);
+      const [duffelResult, ignavResult] = await Promise.allSettled([
+        duffelPromise,
+        ignavPromise
+      ]);
 
       const duffelFlights =
         duffelResult.status === 'fulfilled'
           ? duffelResult.value
           : [];
 
-      const serpFlights =
-        serpResult.status === 'fulfilled'
-          ? serpResult.value
+      const ignavFlights =
+        ignavResult.status === 'fulfilled'
+          ? ignavResult.value
           : [];
 
       if (duffelResult.status === 'rejected') {
         console.error(
           'Duffel search failed:',
-          duffelResult.reason?.message ||
-            duffelResult.reason
+          duffelResult.reason?.message || duffelResult.reason
         );
       }
 
-      if (serpResult.status === 'rejected') {
+      if (ignavResult.status === 'rejected') {
         console.error(
-          'SerpApi search failed:',
-          serpResult.reason?.message ||
-            serpResult.reason
+          'iGnav search failed:',
+          ignavResult.reason?.message || ignavResult.reason
         );
       }
 
-      if (!duffelFlights.length && !serpFlights.length) {
+      // إذا أعاد Duffel أو iGnav أي رحلات، لا نشغّل SerpApi.
+      // هذا يحافظ على ترتيب الأولوية المتفق عليه ويمنع طلبات إضافية غير ضرورية.
+      let serpFlights = [];
+
+      if (!duffelFlights.length && !ignavFlights.length && SERPAPI_SERVICE_URL) {
+        const elapsed = Date.now() - requestStartedAt;
+        const remaining = Math.max(
+          0,
+          SEARCH_TOTAL_TIMEOUT_MS - elapsed
+        );
+
+        if (remaining > 500) {
+          // المرحلة الأولى أخذت وقتها كاملاً بالفعل. الآن فقط نبدأ
+          // البحث الحقيقي في SerpApi، الذي تم إيقاظه في الخلفية منذ بداية الطلب.
+          const serpTimeout = Math.min(
+            SERP_FALLBACK_TIMEOUT_MS,
+            remaining - 250
+          );
+
+          try {
+            const serpRaw = await searchSerpApiService(
+              searchPayload,
+              serpTimeout
+            );
+            serpFlights = await formatSerpApiResults(serpRaw);
+          } catch (err) {
+            console.error(
+              'SerpApi fallback failed:',
+              err?.message || err
+            );
+          }
+        }
+      }
+
+      await ratesWarmup;
+
+      if (
+        !duffelFlights.length &&
+        !ignavFlights.length &&
+        !serpFlights.length
+      ) {
         return res.status(502).json({
-          error:
-            'لم يتم العثور على رحلات حالياً. حاول البحث مرة أخرى.'
+          error: 'لم يتم العثور على رحلات حالياً. حاول البحث مرة أخرى.'
         });
       }
 
-      const merged = mergeFlightResults(
+      // نحافظ على نفس شكل البيانات الحالي:
+      // Duffel + iGnav أولاً، وSerpApi فقط إذا لم تُرجع المرحلة الأولى أي نتائج.
+      const mergedPrimary = mergeFlightResults(
         duffelFlights,
-        serpFlights
+        ignavFlights
       );
 
-      // نفس Smart Distribution الموجود في الموقع، لكن هذه المرة على المصدرين معاً.
-      const formatted =
-        formatSmartDistributedResults(
-          merged
-        );
+      const merged = serpFlights.length
+        ? mergeFlightResults(mergedPrimary, serpFlights)
+        : mergedPrimary;
+
+      const formatted = formatSmartDistributedResults(merged);
 
       return res.json({
         flights: formatted,
@@ -1193,24 +1461,24 @@ app.post(
         currency: 'EGP',
         sources: {
           duffel: duffelFlights.length > 0,
+          ignav: ignavFlights.length > 0,
           serpapi: serpFlights.length > 0,
         }
       });
-
     } catch (err) {
-      console.error(err);
+      console.error('Search error:', err);
 
+      const elapsed = Date.now() - requestStartedAt;
       const status =
-        err?.message?.includes(
-          'انتهت مهلة'
-        )
+        err?.message?.includes('انتهت مهلة') ||
+        elapsed >= SEARCH_TOTAL_TIMEOUT_MS
           ? 504
           : 500;
 
       return res.status(status).json({
         error:
           status === 504
-            ? err.message
+            ? 'تعذر إكمال البحث خلال الوقت المحدد. حاول البحث مرة أخرى.'
             : 'تعذر إكمال البحث حالياً. حاول مرة أخرى.'
       });
     }
@@ -1359,6 +1627,12 @@ app.get(
       serpapiConfigured:
         Boolean(SERPAPI_SERVICE_URL),
 
+      ignavConfigured:
+        Boolean(IGNAV_API_KEY),
+
+      searchMode:
+        'Duffel + iGnav → SerpApi fallback',
+
       mode:
         DUFFEL_TOKEN?.startsWith(
           'duffel_test_'
@@ -1494,7 +1768,7 @@ app.listen(
     );
 
     console.log(
-      '   مصادر البحث: Duffel API + SerpApi Google Flights'
+      '   مصادر البحث: Duffel + iGnav → SerpApi fallback'
     );
 
     console.log(
